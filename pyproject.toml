@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-nano-vllm"
+version = "0.1.0"
+description = "一个极简的 vLLM 风格在线推理服务，用于学习"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",
+]
+
+[project.scripts]
+my_vllm = "my_vllm.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["my_vllm*"]
