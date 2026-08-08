@@ -127,10 +127,13 @@ async def run_server(args: Namespace) -> None:
     # 2. 构造引擎配置
     vllm_config = EngineConfig.from_cli_args(args)
 
-    # 3. 构造引擎前端（当前为占位实现）
+    # 3. 构造引擎前端（创建 ZMQ sockets + 启动引擎进程）
     engine_client = AsyncLLM(vllm_config=vllm_config)
 
     try:
+        # 3.5 握手等待引擎 READY + 启动输出处理
+        await engine_client.start()
+
         # 4. 查询引擎支持的任务
         supported_tasks = await engine_client.get_supported_tasks()
         logger.info("支持的任务: %s", supported_tasks)

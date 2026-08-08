@@ -5,31 +5,23 @@ AsyncLLM — 异步引擎前端
 
 AsyncLLM 是 API 层和引擎后端之间的桥梁:
   - 持有引擎配置
-  - 管理引擎后端进程的生命周期
-  - 转发推理请求到后端引擎（后续 commit 接入 ZMQ 通信）
+  - 通过 MPClient 管理 ZMQ 通信 + 引擎进程
+  - 提供 generate() 接口给 API 路由
 
-架构位置:
-  API 层 (FastAPI)
-      │
-      ▼
-  AsyncLLM        ← 引擎前端（当前文件）
-      │
-      ▼
-  CoreEngineProcManager  ← 进程管理器
-      │
-      ▼
-  EngineCoreProc  ← 引擎后端进程
+完整请求流:
+  HTTP POST → chat_completions()
+      → AsyncLLM.generate()          ← 构造请求, 通过 ZMQ 发送
+          → MPClient.generate()      ← ROUTER → DEALER
+              → EngineCoreProc       ← 引擎进程处理
+          ← MPClient._process_outputs()  ← PULL ← PUSH
+      ← StreamingResponse (SSE)      ← 逐 token 返回给客户端
 """
 
 import asyncio
 import logging
 
 from my_vllm.config import EngineConfig
-from my_vllm.engine.core_client import (
-    CoreEngineProcManager,
-    launch_core_engines,
-    shutdown_processes,
-)
+from my_vllm.engine.core_client import MPClient
 
 logger = logging.getLogger(__name__)
 
@@ -37,50 +29,67 @@ logger = logging.getLogger(__name__)
 class AsyncLLM:
     """异步 LLM 引擎前端
 
-    对应 vLLM 的 AsyncLLM，当前阶段负责:
-      - 持有引擎配置
-      - 启动/管理引擎后端进程
-      - 提供模型信息给 API 层
+    对应 vLLM 的 AsyncLLM
 
-    后续 commit 将增加:
-      - ZMQ 通信（ROUTER/DEALER + PUSH/PULL）
-      - 真实的 generate() → EngineCoreRequest → EngineCoreOutput
-      - output_handler 后台任务处理引擎输出
+    生命周期:
+      1. __init__()    构造 MPClient（创建 ZMQ sockets + 启动引擎进程）
+      2. start()       握手等待引擎 READY + 启动输出处理任务
+      3. generate()    处理推理请求
+      4. shutdown()    清理
+
+    后续 commit 增加:
+      - self.renderer:       OnlineRenderer (tokenizer + chat template)
+      - self.input_processor: InputProcessor (EngineInput → EngineCoreRequest)
+      - self.output_processor: OutputProcessor (EngineCoreOutput → RequestOutput)
     """
 
     def __init__(self, vllm_config: EngineConfig):
         self.vllm_config = vllm_config
         self.model_config = vllm_config
         self._errored = False
+        self._started = False
 
         engine_count = vllm_config.data_parallel_size
         logger.info(
-            "AsyncLLM 正在启动 %d 个引擎后端进程 (model=%s, max_model_len=%d)...",
-            engine_count,
+            "AsyncLLM 正在构造 (model=%s, engine_count=%d)...",
             vllm_config.model,
-            vllm_config.max_model_len,
+            engine_count,
         )
 
-        # 创建并启动引擎后端进程
-        # 对应 vLLM: MPClient.__init__() → launch_core_engines()
-        self._engine_manager = CoreEngineProcManager(
-            engine_count=engine_count,
+        # 构造传输层 — 创建 ZMQ sockets + 启动引擎进程
+        # 对应 vLLM: self.engine_core = AsyncMPClient(...)
+        self.mp_client = MPClient(
             vllm_config=vllm_config,
+            engine_count=engine_count,
         )
-        self._engine_manager.start_all()
-
-        # 给子进程一点时间完成初始化（后续 commit 改为 ZMQ 握手确认）
-        import time
-        time.sleep(0.5)
 
         logger.info(
-            "AsyncLLM 初始化完成，已启动 %d 个引擎后端进程",
+            "AsyncLLM 构造完成 (model=%s, engine_count=%d) — "
+            "请在 event loop 中调用 start() 完成握手",
+            vllm_config.model,
             engine_count,
         )
 
     @property
     def errored(self) -> bool:
-        return self._errored
+        return self._errored or self.mp_client.engine_dead
+
+    # ---- 启动 ----
+
+    async def start(self) -> None:
+        """启动引擎前端 — 握手 + 输出处理
+
+        必须在 asyncio event loop 中调用（即 API server 启动后）
+        """
+        if self._started:
+            return
+
+        # 握手等待引擎 READY + 启动输出处理任务
+        await self.mp_client.start()
+        self._started = True
+        logger.info("AsyncLLM 启动完成")
+
+    # ---- 模型信息 ----
 
     async def get_supported_tasks(self) -> tuple[str, ...]:
         """返回引擎支持的任务类型"""
@@ -89,14 +98,18 @@ class AsyncLLM:
     async def do_log_stats(self) -> None:
         """输出统计日志"""
         alive = sum(
-            1 for p in self._engine_manager.processes if p.is_alive()
+            1
+            for p in self.mp_client._engine_manager.processes
+            if p.is_alive()
         )
         logger.info(
             "[Stats] 模型=%s, 引擎进程=%d/%d 存活",
             self.vllm_config.model,
             alive,
-            len(self._engine_manager.processes),
+            len(self.mp_client._engine_manager.processes),
         )
+
+    # ---- 推理接口 ----
 
     async def generate(
         self,
@@ -104,20 +117,45 @@ class AsyncLLM:
         max_tokens: int = 100,
         temperature: float = 0.0,
     ) -> str:
-        """
-        占位推理 — 后续 commit 接入 ZMQ 通信后替换为真实推理
+        """通过 ZMQ 发送推理请求到引擎后端, 等待返回结果
 
-        当前返回模拟回复，用于验证架构连通性
+        对应 vLLM AsyncLLM.generate()
+
+        流程:
+          1. 确保已启动（懒 start, 防止忘记调用 start()）
+          2. 通过 mp_client 发送 ROUTER → DEALER
+          3. 等待 PULL ← PUSH 返回结果
+
+        Args:
+            prompt:     文本 prompt
+            max_tokens: 最大生成 token 数（预留）
+            temperature: 采样温度（预留）
+
+        Returns:
+            引擎生成的文本
         """
+        # 懒启动 — 如果还没调用 start(), 自动启动
+        if not self._started:
+            await self.start()
+
         logger.info(
-            "收到推理请求: prompt=%.50s..., max_tokens=%d", prompt, max_tokens
+            "收到推理请求: prompt=%.50s..., max_tokens=%d",
+            prompt,
+            max_tokens,
         )
-        # 模拟推理延迟
-        await asyncio.sleep(0.1)
-        return f"[占位回复] 引擎已启动，收到: {prompt[:50]}..."
+
+        # 通过 ZMQ 发送到引擎后端, 等待返回
+        result = await self.mp_client.generate(prompt)
+        logger.info("推理完成: result=%.50s...", result)
+        return result
+
+    # ---- 关闭 ----
 
     async def shutdown(self, timeout: float | None = None) -> None:
-        """关闭引擎前端，终止所有引擎后端进程"""
+        """关闭引擎前端, 清理所有资源"""
         logger.info("AsyncLLM 正在关闭...")
-        shutdown_processes(self._engine_manager.processes)
+        self._started = False
+
+        # 关闭传输层（终止引擎进程 + 清理 ZMQ）
+        self.mp_client.shutdown()
         logger.info("AsyncLLM 已关闭")

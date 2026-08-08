@@ -1,15 +1,16 @@
 """
-OpenAI 兼容 Chat Completions 接口（占位实现）
+OpenAI 兼容 Chat Completions 接口
 
-POST /v1/chat/completions → 流式返回模拟 token
+POST /v1/chat/completions → 通过 ZMQ 发送到引擎后端 → 返回完整回复
+
+后续 commit 实现流式 SSE（逐 token）
 """
 
-import asyncio
 import json
 import time
 
 from fastapi import APIRouter, FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse
 
 router = APIRouter()
 
@@ -19,71 +20,61 @@ async def chat_completions(request: Request):
     """
     OpenAI 兼容的 /v1/chat/completions 接口
 
-    当前为占位实现，返回模拟的流式 token 序列。
-    后续对接真实引擎后替换为真正推理。
+    流程:
+      1. 解析请求中的 messages
+      2. 拼接成 prompt 字符串
+      3. 通过 AsyncLLM.generate() → ZMQ → 引擎后端 → 返回结果
+      4. 返回 JSON 格式响应（非流式）
+
+    后续 commit 实现:
+      - 流式 SSE（逐 token）
+      - tokenizer 预处理（apply chat template）
     """
-    # 读取请求体
     body = await request.json()
     messages = body.get("messages", [])
     model = body.get("model", request.app.state.served_model_name)
+    max_tokens = body.get("max_tokens", 100)
 
-    # 提取最后一条用户消息
-    user_prompt = ""
+    # 提取用户消息拼接为 prompt
+    # 后续 commit: 使用 tokenizer.apply_chat_template()
+    prompt_parts = []
     for msg in messages:
-        if msg.get("role") == "user":
-            user_prompt = msg.get("content", "")
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        prompt_parts.append(f"[{role}]: {content}")
+    prompt = "\n".join(prompt_parts)
 
+    # 通过引擎前端发送推理请求
+    engine_client = request.app.state.engine_client
+    generated_text = await engine_client.generate(
+        prompt=prompt,
+        max_tokens=max_tokens,
+    )
+
+    # 构造 OpenAI 兼容响应
     chat_id = f"chatcmpl-{int(time.time())}"
-
-    async def generate():
-        """逐 token 流式输出（SSE 格式）"""
-        tokens = [
-            "你好",
-            "！",
-            "我是",
-            "my_vllm",
-            "，",
-            "一个",
-            "极简",
-            "推理",
-            "服务",
-            "。",
-        ]
-        for i, token in enumerate(tokens):
-            chunk = {
-                "id": chat_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": token},
-                        "finish_reason": None,
-                    }
-                ],
+    response = {
+        "id": chat_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": generated_text,
+                },
+                "finish_reason": "stop",
             }
-            yield f"data: {json.dumps(chunk)}\n\n"
-            await asyncio.sleep(0.2)  # 模拟推理延迟
-
-        # 结束标记
-        final_chunk = {
-            "id": chat_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop",
-                }
-            ],
-        }
-        yield f"data: {json.dumps(final_chunk)}\n\n"
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
+        ],
+        "usage": {
+            "prompt_tokens": len(prompt),
+            "completion_tokens": len(generated_text),
+            "total_tokens": len(prompt) + len(generated_text),
+        },
+    }
+    return JSONResponse(content=response)
 
 
 def attach_router(app: FastAPI):
