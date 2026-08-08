@@ -16,6 +16,8 @@ class EngineConfig:
     disable_log_stats: bool = False
     served_model_name: str | None = None
     max_model_len: int = 4096
+    data_parallel_size: int = 1  # DP 并行度（引擎后端进程数）
+    enable_log_requests: bool = False
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "EngineConfig":
@@ -26,6 +28,8 @@ class EngineConfig:
             disable_log_stats=args.disable_log_stats,
             served_model_name=args.served_model_name,
             max_model_len=args.max_model_len,
+            data_parallel_size=getattr(args, "data_parallel_size", 1),
+            enable_log_requests=getattr(args, "enable_log_requests", False),
         )
 
 
@@ -64,5 +68,11 @@ def make_arg_parser() -> argparse.ArgumentParser:
         "--enable-log-requests",
         action="store_true",
         help="启用请求日志",
+    )
+    parser.add_argument(
+        "--data-parallel-size",
+        type=int,
+        default=1,
+        help="数据并行度（引擎后端进程数）",
     )
     return parser

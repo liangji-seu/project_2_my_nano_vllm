@@ -1,0 +1,25 @@
+# ============================================================
+# my_vllm — 非 GPU 开发阶段依赖
+# ============================================================
+# 安装方式: pip install -r requirements.txt
+# ============================================================
+
+# --- Web 框架 & HTTP 服务 ---
+fastapi>=0.110,<0.120       # API 框架 (FastAPI, APIRouter, Request, StreamingResponse)
+uvicorn[standard]>=0.29,<0.40  # ASGI 服务器 (已内置 httptools + uvloop)
+starlette>=0.37              # FastAPI 底层框架 (State, 中间件等)
+
+# --- 数据校验 ---
+pydantic>=2.0                # 请求/响应模型校验 (FastAPI 自带，这里显式声明)
+
+# --- Tokenizer (CPU only, 用于测 scheduler / block manager) ---
+# 不装 transformers (会拖 PyTorch 进来), 只装轻量的 tokenizers
+tokenizers>=0.19,<0.22       # HuggingFace Rust tokenizer, 纯 CPU, 不依赖 PyTorch
+
+# --- ZMQ 通信 ---
+pyzmq>=26                    # ZeroMQ Python 绑定（ROUTER/DEALER/PUSH/PULL）
+
+# --- 开发 & 测试 ---
+pytest>=8.0                  # 单元测试框架
+pytest-asyncio>=0.23         # 异步测试支持
+httpx>=0.27                  # 异步 HTTP 客户端, 用于测试 FastAPI 接口
