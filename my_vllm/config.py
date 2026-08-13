@@ -63,6 +63,15 @@ class EngineConfig:
     enable_log_requests: bool = False
     seed: int = 0  # 随机种子，保证推理链的确定性
 
+    # ---- KV cache 配置（简化版 CacheConfig）----
+    block_size: int = 16        # 每个 KV block 容纳的 token 数
+    num_gpu_blocks: int = 1024  # KV block 总数（TODO: 后续按「可用显存 × 利用率」自动计算）
+    enable_prefix_caching: bool = True  # 是否启用前缀缓存（prefix caching）
+
+    # ---- 调度器配置（简化版 SchedulerConfig）----
+    max_num_seqs: int = 32             # 同时处于 RUNNING 状态的请求数上限
+    max_num_batched_tokens: int = 2048  # 单步调度（一个 batch）的 token 预算
+
     # 并行配置（TP/PP），预留给后续并行优化
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
 
@@ -78,6 +87,11 @@ class EngineConfig:
             data_parallel_size=getattr(args, "data_parallel_size", 1),
             enable_log_requests=getattr(args, "enable_log_requests", False),
             seed=getattr(args, "seed", 0),
+            block_size=getattr(args, "block_size", 16),
+            num_gpu_blocks=getattr(args, "num_gpu_blocks", 1024),
+            enable_prefix_caching=not getattr(args, "disable_prefix_caching", False),
+            max_num_seqs=getattr(args, "max_num_seqs", 32),
+            max_num_batched_tokens=getattr(args, "max_num_batched_tokens", 2048),
             parallel_config=ParallelConfig(
                 tensor_parallel_size=getattr(args, "tensor_parallel_size", 1),
                 pipeline_parallel_size=getattr(args, "pipeline_parallel_size", 1),
@@ -144,5 +158,34 @@ def make_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="随机种子（保证推理确定性）",
+    )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=16,
+        help="KV cache 每个 block 容纳的 token 数",
+    )
+    parser.add_argument(
+        "--num-gpu-blocks",
+        type=int,
+        default=1024,
+        help="KV cache block 总数（占位值，后续按显存自动计算）",
+    )
+    parser.add_argument(
+        "--disable-prefix-caching",
+        action="store_true",
+        help="禁用前缀缓存（prefix caching）",
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=32,
+        help="同时处于 RUNNING 状态的请求数上限",
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=2048,
+        help="单步调度（一个 batch）的 token 预算",
     )
     return parser
