@@ -43,6 +43,7 @@
                             - (创建) self.finished_req_ids, 上一轮完成的req集合
                             - (创建) self.reset_preempted_req_ids, 本轮被抢占的req 集合
                             - (构造) self.kv_cache_manager = KVCacheManager() 显存块管理器
+                                - 待定
                             - (调用) self.connector, PD 分离用的
                             - (保存) self.current_step 调度步数计数器
                             - (保存) self._pause_state 调度器状态
