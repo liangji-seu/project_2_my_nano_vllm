@@ -30,18 +30,31 @@ class EngineCore:
     对应 vLLM 的 EngineCore
 
     组件：
-      - self.scheduler:       调度器（管理请求队列 + KV cache 分配）—— 预留
-      - self.model_executor:  模型执行器（管理 GPU worker，执行 forward）
-      - self.kv_cache_config: KV cache 配置（block 大小、数量等）—— 预留
+      - self.scheduler:        调度器（请求队列 + KV cache 分配 + 输出推进）
+      - self.kv_cache_manager: KV cache 管理器（block 池 + 前缀缓存 + 引用计数）
+      - self.model_executor:   模型执行器（管理 GPU worker，执行 forward）
+      - self.kv_cache_config:  KV cache 配置（简化：直接复用 EngineConfig）
     """
 
     def __init__(self, vllm_config: EngineConfig):
         self.vllm_config = vllm_config
         self._is_running = True
 
-        # 预留组件（后续 commit 实现）
-        self.scheduler = None
-        self.kv_cache_config = None
+        # KV cache 管理器：物理 block 池 + 前缀缓存 + 引用计数（CPU 侧账本）
+        from my_vllm.v1.core.kv_cache_manager import KVCacheManager
+
+        self.kv_cache_config = vllm_config  # 简化：直接用 EngineConfig 充当 CacheConfig
+        self.kv_cache_manager = KVCacheManager(
+            num_gpu_blocks=vllm_config.num_gpu_blocks,
+            block_size=vllm_config.block_size,
+            max_model_len=vllm_config.max_model_len,
+            enable_caching=vllm_config.enable_prefix_caching,
+        )
+
+        # 调度器：每步选出哪些请求、分配多少 token 和 KV block
+        from my_vllm.v1.core.sched.scheduler import Scheduler
+
+        self.scheduler = Scheduler(vllm_config, self.kv_cache_manager)
 
         # 创建执行器：拉起所有 worker 进程。
         # worker 的【阶段 1/3】init_device 与【阶段 2/3】load_model 在
@@ -68,8 +81,8 @@ class EngineCore:
         阶段 3 由 EngineCore 通过 collective_rpc 统一触发，让每个 worker 分配
         KV cache 显存。
         """
-        # 简化：block 数先写死占位值；真实实现要根据「可用显存 × 利用率」计算
-        num_gpu_blocks = 1024
+        # 简化：block 数直接取配置值；真实实现要根据「可用显存 × 利用率」计算
+        num_gpu_blocks = self.vllm_config.num_gpu_blocks
         results = self.model_executor.initialize_cache(num_gpu_blocks)
         logger.info("KV cache 初始化完成，各 worker ack：%s", results)
 
@@ -305,12 +318,11 @@ class EngineCoreProc(EngineCore):
 
         对应 vLLM EngineCore.run_busy_loop():
           while is_running:
-            1. _process_input_queue()  — 从 input_queue 取 EngineCoreRequest
-            2. _process_engine_step()  — 调用 scheduler.schedule() + executor 前向
-
-        当前阶段: worker 进程已启动并完成三阶段初始化，但 scheduler 与
-        ModelRunner 尚未实现，所以主循环仍生成模拟结果。
-        后续 commit 实现 scheduler.schedule() + executor.execute_model()。
+            1. _process_input_queue()  — 把 input_queue 里的请求转成 Request 交给 scheduler
+            2. scheduler.schedule()    — 选出本轮要算的请求 + 分配 KV cache
+            3. executor.execute_model()— 执行前向 + 采样（ModelRunner 未实现，暂用 mock）
+            4. scheduler.update_from_output() — 推进请求状态 / 判定结束
+            5. _send_finished_outputs()       — 把已结束请求的结果送回前端
         """
         logger.info(
             "EngineCore 进入主循环 (index=%d, dp_size=%d)",
@@ -319,36 +331,106 @@ class EngineCoreProc(EngineCore):
         )
 
         while self.is_running():
-            # 1) 从 input_queue 取请求（带超时, 以便检查 is_running）
-            try:
-                request = self.input_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
+            # 1) 批量接收新请求，交给调度器
+            self._process_input_queue()
 
-            logger.info(
-                "EngineCore 处理请求: request_id=%s, prompt=%.40s...",
-                request.get("request_id"),
-                request.get("prompt", ""),
-            )
+            # 2) 调度：选出本轮要执行的请求
+            scheduler_output = self.scheduler.schedule()
 
-            # 2) TODO: 调用 scheduler.schedule() + executor.execute_model() 执行真实推理
-            #    （worker 进程已就绪，但 ModelRunner 骨架尚未实现 forward，故暂用模拟结果）
+            # 3) 执行：真实实现走 self.model_executor.execute_model()；
+            #    ModelRunner.forward 尚未实现，暂用确定性 mock 采样占位。
+            if scheduler_output.total_num_scheduled_tokens > 0:
+                model_runner_output = self._execute_model(scheduler_output)
+                self.scheduler.update_from_output(scheduler_output, model_runner_output)
 
-            # 模拟推理延迟
-            time.sleep(0.2)
+            # 4) 回传已结束请求的输出
+            self._send_finished_outputs()
 
-            # 3) 构造输出, 放入 output_queue → 输出线程发送回前端
-            output = {
-                "request_id": request["request_id"],
-                "text": (
-                    f"[引擎回复 index={self.engine_index}] "
-                    f"收到: {request.get('prompt', '')[:50]}..."
-                ),
-                "finish_reason": "stop",
-            }
-            self.output_queue.put(output)
+            # 空闲时小睡，避免忙等占满 CPU
+            time.sleep(0.005)
 
         logger.info("EngineCore 退出主循环 (index=%d)", self.engine_index)
+
+    # ---- 主循环内部步骤 ----
+
+    def _process_input_queue(self) -> None:
+        """把 input_queue 里的原始请求全部取出，转成 Request 交给调度器"""
+        while True:
+            try:
+                raw = self.input_queue.get_nowait()
+            except queue.Empty:
+                break
+            request = self._build_request(raw)
+            self.scheduler.add_request(request)
+
+    def _build_request(self, raw: dict) -> "Request":
+        """把前端传来的 {request_id, prompt} 转成 Request 对象
+
+        占位 tokenizer：字符级编码（每个字符一个 token id = ord(ch)）。
+        真实实现应替换为 HuggingFace tokenizer 的 encode()。
+        """
+        from my_vllm.v1.request import Request, SamplingParams
+
+        prompt = raw.get("prompt", "")
+        prompt_token_ids = [ord(ch) for ch in prompt]
+        max_tokens = raw.get("max_tokens", self.vllm_config.max_model_len)
+        return Request(
+            request_id=raw["request_id"],
+            prompt_token_ids=prompt_token_ids,
+            sampling_params=SamplingParams(max_tokens=max_tokens),
+        )
+
+    def _execute_model(self, scheduler_output: "SchedulerOutput") -> "ModelRunnerOutput":
+        """执行一次前向 + 采样，返回每个请求本轮采出的 token
+
+        TODO: 替换为真实实现 self.model_executor.execute_model(scheduler_output)。
+        在 ModelRunner.forward 骨架实现前，用确定性 mock 采样占位：
+        每个请求每步生成一个可打印字符，保证主循环能跑通、请求能正常结束。
+        """
+        from my_vllm.v1.core.sched.output import ModelRunnerOutput
+
+        req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        sampled_token_ids: list[list[int]] = []
+        for req_id in req_ids:
+            request = self.scheduler.requests[req_id]
+            # 确定性「采样」：根据已生成长度轮转 a..z，避免 control 字符污染输出
+            token_id = ord("a") + (request.num_output_tokens % 26)
+            sampled_token_ids.append([token_id])
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            sampled_token_ids=sampled_token_ids,
+            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+        )
+
+    def _send_finished_outputs(self) -> None:
+        """把本步判定结束的请求结果送回 output_queue → 前端
+
+        finish_reason 取 Request.get_finished_reason()；detokenize 用字符级解码
+        （与 _build_request 的字符级编码对应，真实实现替换为 tokenizer.decode()）。
+        """
+        for req_id in list(self.scheduler.finished_req_ids):
+            request = self.scheduler.requests.get(req_id)
+            self.scheduler.finished_req_ids.discard(req_id)
+            if request is None:
+                continue
+
+            finish_reason = request.get_finished_reason()
+            output = {
+                "request_id": req_id,
+                "text": self._detokenize(request.output_token_ids),
+                "finish_reason": finish_reason.value if finish_reason else "stop",
+            }
+            self.output_queue.put(output)
+            self.scheduler.requests.pop(req_id, None)
+            logger.info(
+                "请求 %s 完成: finish_reason=%s, output_tokens=%d",
+                req_id, finish_reason, request.num_output_tokens,
+            )
+
+    @staticmethod
+    def _detokenize(token_ids: list[int]) -> str:
+        """占位 detokenizer：字符级解码（对应 _build_request 的字符级编码）"""
+        return "".join(chr(t) for t in token_ids)
 
     def shutdown(self) -> None:
         """关闭引擎, 清理 ZMQ 资源"""
