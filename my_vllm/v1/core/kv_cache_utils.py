@@ -86,9 +86,6 @@ class FreeKVCacheBlockQueue:
         self._queue.appendleft(block)
         self.num_free_blocks += 1
 
-    def get_all_free_blocks(self) -> list[KVCacheBlock]:
-        return list(self._queue)
-
 
 class BlockPool:
     """物理 block 池：分配 / 释放 / 引用计数 + 前缀缓存索引
@@ -164,17 +161,20 @@ class BlockPool:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
 
-    def free_blocks(self, ordered_blocks: list[KVCacheBlock]) -> None:
-        """释放一组 block，引用计数 -1；归零则放回空闲队列（队头 = 最先驱逐）
+    def free_blocks(self, blocks: list[KVCacheBlock]) -> None:
+        """释放一组 block，引用计数 -1；归零则放回空闲队列
 
-        参数需按「驱逐优先级」排序（首个最先驱逐）。调用方会按逆序传入，
-        使序列尾部的 block 先被回收（尾块更晚使用，LRU 更「新」）。
+        参数按「分配顺序」传入（序列 head 在前、tail 在后）。实现上依次 prepend，
+        使序列尾部的 block 最终落在空闲队列最前（最先被驱逐）——这样能尽量保留
+        序列头部的 prompt 前缀 block，供后续请求做前缀缓存复用（对应 vLLM 的
+        「逆序释放，尾部先驱逐」语义）。
+
+        归零的 block 仍保留 hash（懒驱逐）：它成为驱逐候选，真正分配时才清 hash。
         """
-        for block in reversed(ordered_blocks):
+        for block in blocks:
             assert block.ref_cnt > 0, f"block {block.block_id} 引用计数异常"
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
-                # 归零仍保留 hash（懒驱逐）：它成为驱逐候选，分配时再真正驱逐
                 self.free_block_queue.prepend(block)
 
     # ---- 查询 ----
