@@ -2,7 +2,7 @@
 引擎后端 — EngineCore + EngineCoreProc
 
 分层：
-  EngineCore:        纯推理逻辑（scheduler + executor + KV cache）— 预留
+  EngineCore:        纯推理逻辑（scheduler + executor + KV cache）
   EngineCoreProc:    子进程包装 + ZMQ 通信层（DEALER/PUSH + IO 线程）
 
 对应 vLLM 的 vllm/v1/engine/core.py
@@ -29,27 +29,58 @@ class EngineCore:
     一个 EngineCore = 一个完整的调度域（一个 scheduler + 一组 worker）
     对应 vLLM 的 EngineCore
 
-    预留组件：
-      - self.scheduler:       调度器（管理请求队列 + KV cache 分配）
+    组件：
+      - self.scheduler:       调度器（管理请求队列 + KV cache 分配）—— 预留
       - self.model_executor:  模型执行器（管理 GPU worker，执行 forward）
-      - self.kv_cache_config: KV cache 配置（block 大小、数量等）
+      - self.kv_cache_config: KV cache 配置（block 大小、数量等）—— 预留
     """
 
     def __init__(self, vllm_config: EngineConfig):
         self.vllm_config = vllm_config
         self._is_running = True
+
+        # 预留组件（后续 commit 实现）
+        self.scheduler = None
+        self.kv_cache_config = None
+
+        # 创建执行器：拉起所有 worker 进程。
+        # worker 的【阶段 1/3】init_device 与【阶段 2/3】load_model 在
+        # worker 进程内直接执行，此调用返回时 worker 已就绪。
+        from my_vllm.executor.multiproc_executor import MultiprocExecutor
+
+        self.model_executor = MultiprocExecutor(vllm_config)
+
+        # 【Worker 初始化 · 阶段 3/3】通过 collective_rpc 让所有 worker 初始化 KV cache
+        self._initialize_kv_caches()
+
         logger.info(
             "EngineCore 初始化完成 (model=%s, max_model_len=%d)",
             vllm_config.model,
             vllm_config.max_model_len,
         )
 
+    def _initialize_kv_caches(self) -> None:
+        """【Worker 初始化 · 阶段 3/3】Initialize KV Cache
+
+        对应 vLLM EngineCore._initialize_kv_caches()。
+
+        阶段 1（init_device）和阶段 2（load_model）在 worker 进程内直接执行；
+        阶段 3 由 EngineCore 通过 collective_rpc 统一触发，让每个 worker 分配
+        KV cache 显存。
+        """
+        # 简化：block 数先写死占位值；真实实现要根据「可用显存 × 利用率」计算
+        num_gpu_blocks = 1024
+        results = self.model_executor.initialize_cache(num_gpu_blocks)
+        logger.info("KV cache 初始化完成，各 worker ack：%s", results)
+
     def is_running(self) -> bool:
         return self._is_running
 
     def shutdown(self) -> None:
-        """关闭引擎，清理资源"""
+        """关闭引擎，清理资源（含 worker 进程）"""
         self._is_running = False
+        if hasattr(self, "model_executor"):
+            self.model_executor.shutdown()
         logger.info("EngineCore 已关闭")
 
 
@@ -277,8 +308,9 @@ class EngineCoreProc(EngineCore):
             1. _process_input_queue()  — 从 input_queue 取 EngineCoreRequest
             2. _process_engine_step()  — 调用 scheduler.schedule() + executor 前向
 
-        当前阶段: 从 input_queue 取请求, 生成模拟结果, 放入 output_queue
-        后续 commit 实现真实的 scheduler + executor
+        当前阶段: worker 进程已启动并完成三阶段初始化，但 scheduler 与
+        ModelRunner 尚未实现，所以主循环仍生成模拟结果。
+        后续 commit 实现 scheduler.schedule() + executor.execute_model()。
         """
         logger.info(
             "EngineCore 进入主循环 (index=%d, dp_size=%d)",
@@ -299,8 +331,8 @@ class EngineCoreProc(EngineCore):
                 request.get("prompt", ""),
             )
 
-            # 2) TODO: 调用 scheduler + executor 执行真实推理
-            #    self._process_engine_step()
+            # 2) TODO: 调用 scheduler.schedule() + executor.execute_model() 执行真实推理
+            #    （worker 进程已就绪，但 ModelRunner 骨架尚未实现 forward，故暂用模拟结果）
 
             # 模拟推理延迟
             time.sleep(0.2)
