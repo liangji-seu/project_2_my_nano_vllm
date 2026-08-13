@@ -124,9 +124,9 @@ class KVCacheManager:
             hit_blocks.append(block)
 
         num_hit_tokens = len(hit_blocks) * self.block_size
-        if hit_blocks:
-            # touch：命中 block 的 ref_cnt +1（若原本是驱逐候选，从空闲队列移出）
-            self.block_pool.touch(hit_blocks)
+        # 注意：这里只「读」不 touch（不改引用计数）。真正 touch 要延后到
+        # allocate_slots() 里、通过空闲 block 检查之后再做，否则一旦分配失败，
+        # 这些命中 block 的 ref_cnt 会白加一次，导致引用计数泄漏。
         return KVCacheBlocks((hit_blocks,)), num_hit_tokens
 
     # ---- 分配 ----
@@ -155,24 +155,36 @@ class KVCacheManager:
             raise ValueError("num_new_tokens 必须大于 0")
 
         req_id = request.request_id
+        # 请求此前已分配的 block（running 请求非空；waiting 请求首次调度为空）
         blocks = list(self.req_to_blocks.get(req_id, []))
 
-        # 1. 挂载前缀缓存命中的 block（首次调度时）
+        # 本轮前缀缓存命中的 block（仅首次调度时非空）
+        computed_blocks: list[KVCacheBlock] = []
         if new_computed_blocks is not None and new_computed_blocks.blocks[0]:
-            blocks.extend(new_computed_blocks.blocks[0])
+            computed_blocks = list(new_computed_blocks.blocks[0])
 
-        # 2. 计算需要新分配的 block 数
-        # 已计算的 token = request 已有 computed + 本轮前缀命中
+        # 1. 计算需要新分配的 block 数
+        # 需要覆盖的总 token = 已计算 + 前缀命中 + 本轮新算
         total_computed = request.num_computed_tokens + num_new_computed_tokens
         total_need_slot = min(total_computed + num_new_tokens, self.max_model_len)
 
         num_blocks_needed = cdiv(total_need_slot, self.block_size)
-        num_new_blocks = num_blocks_needed - len(blocks)
+        num_new_blocks = num_blocks_needed - len(blocks) - len(computed_blocks)
 
-        # 3. 显存不足则失败（由 Scheduler 决定是否抢占）
-        if num_new_blocks > 0 and num_new_blocks > self.block_pool.get_num_free_blocks():
+        # 2. 显存不足则失败（不 touch、不修改任何账本）
+        # 命中 block 里 ref_cnt==0 的原本挂在空闲队列（驱逐候选），touch 会把它移出，
+        # 因此实际可用于「新分配」的空闲数要扣掉它们。
+        num_hit_candidates = sum(1 for b in computed_blocks if b.ref_cnt == 0)
+        available = self.block_pool.get_num_free_blocks() - num_hit_candidates
+        if num_new_blocks > available:
             return None
 
+        # 3. 挂载命中 block（touch：ref_cnt +1，驱逐候选从空闲队列移出）
+        if computed_blocks:
+            self.block_pool.touch(computed_blocks)
+            blocks.extend(computed_blocks)
+
+        # 4. 分配新的 block
         new_blocks: list[KVCacheBlock] = []
         if num_new_blocks > 0:
             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
@@ -180,7 +192,7 @@ class KVCacheManager:
 
         self.req_to_blocks[req_id] = blocks
 
-        # 4. 把已写满的 block 注册进前缀缓存（供后续请求复用）
+        # 5. 把已写满的 block 注册进前缀缓存（供后续请求复用）
         num_tokens_to_cache = min(total_computed + num_new_tokens, request.num_tokens)
         self.cache_blocks(request, num_tokens_to_cache)
 
