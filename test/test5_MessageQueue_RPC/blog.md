@@ -1,0 +1,132 @@
+【引擎后端进程 EngineCoreProc 】
+    - (构造)CoreEngineProcManager.init
+        - ....
+        - 启动EngineCoreProc.run_engine_core进程
+            -(构造)EngineCoreProc（EngineCore）.init()
+                - (创建)输入请求队列self.input_queue，输出请求队列self.output_queue
+                -（保存）引擎编号 self.engine_index = Dealer套接字identity
+                - (过程) 和引擎前端的握手
+                    - (保存) self.address = address 记录前端的联系方式
+                    - (构造)EngineCore.init()
+                        - (构造执行器)：self.model_executor = MultiprocExecutor.init()
+                            - (构造) Executor.init()
+                                - (调用) 调用子类的_init_executor()
+                            - (调用) _init_executor()
+                                - (计算) world_size = tp x pp x pcp
+                                - (调用) 设置worker的torch线程环境
+                                - (计算) MultiprocExecutor 的 zmq 的 URL
+                                - (构造) self.rpc_broadcast_mq : MessageQueue
+                                - (计算) 连接执行器的信息：scheduler_output_handle
+                                - (while)
+                                    - (计算) 每个worker的rank
+                                    - (调用) WorkerProc.make_worker_process()
+                                        - (构造) 管道1:ready;  管道2:death 
+                                        - (启动新进程，WorkerProc.worker_main)              >>>>>【Worker # N】
+                                    - (保存) 把 unready_worker_handle 加入 unready_workers列表
+                                - (阻塞调用)self.workers : List[ WorkerProcHandle ]= WorkerProc.wait_for_ready(unready_workers) 等待所有Worker进程管道发生READY
+                                - (创建) self.response_mqs 收集每一个worker的回复队列
+                                - (调用) self.rpc_broadcast_mq.wait_until_ready() 验证发送通道的通路
+                                - (调用) response_mq.wait_until_ready() 验证接受通道的通路
+                                - (创建) future = deque[FutureWrapper] 创建异步RPC的结果future FIFO队列
+                                - (调用) success = True， 执行器启动成功
+                        - self.available_gpu_memory_for_kv_cache 记录kvcache的显存容量
+                        - 【worker初始化第三步】self._initialize_kv_caches(vllm_config), （EngineCore让执行器RPC）让执行器RPC调用Worker初始化kvcache
+                        - (构造) structured_output_manager = StructuredOutputManager.init()
+                        - (构造调度器) self.scheduler = Scheduler.init()
+                            - (保存) self.structured_output_manager = structured_output_manager
+                            - (保存) self.max_num_running_reqs 每轮最大请求数
+                            - (保存) self.max_num_scheduled_tokens 每轮最大token数
+                            - (保存) self.max_model_len 模型kvcache上下文窗口最大长度
+                            - (保存) self.requests : dict 请求集合
+                            - (保存) self.policy 调度策略
+                            - (创建) self.waiting, self.skipped_waiting, self.running 
+                            - (创建) self.finished_req_ids, 上一轮完成的req集合
+                            - (创建) self.reset_preempted_req_ids, 本轮被抢占的req 集合
+                            - (构造) self.kv_cache_manager = KVCacheManager() 显存块管理器
+                            - (调用) self.connector, PD 分离用的
+                            - (保存) self.current_step 调度步数计数器
+                            - (保存) self._pause_state 调度器状态
+                            - (保存) self._inflight_prefills 正在prefill的req的集合
+                        - (构造)(远程kv) kv_connector, PD分离的通信管道
+                        - (调用) 指定引擎self.step_fn() = self.step()
+                - (线程1)：输入线程process_input_sockets
+                - (线程2)：输出线程process_output_sockets
+            - (调用)EngineCoreProc.run_busy_loop()
+                - 【loop】
+                    - (调用) self._process_input_queue() 收集引擎后端进程的ZMQ的请求，放入调度器队列
+                    - (调用) self._process_engine_step() 引擎后端执行一步
+                        - (调用) outputs, model_executed = self.step_fn()，执行指定的方法
+                        - (调用) 把outputs 放入output_queue
+
+
+
+【Worker - # N 进程-WorkerProc】
+    - WorkerProc.worker_main() 工厂函数
+        - (保存) ready_writer, death_pipe （与引擎后端进程连接 的 管道）
+        - (构造) worker = WorkerProc.init()
+            - (保存) self.rank = rank
+            - (构造) wrapper = WorkerWrapperBase.init()
+                - (声明) self.worker是WorkerBase类
+            - (调用) wrapper.init_worker()
+                - (构造) self.worker = worker_class()(子类) = Worker.init()
+                    - (构造) WorkerBase.init()
+                        - (声明) 定义抽象接口：
+                            - 各种配置
+                            - self.device : torch.device
+                            - self.model_runner : nn.Module
+                            - self.rank = rank
+                            - self.distributed_init_method (执行器的联系方式)
+                    - (保存) 使用的model_runner 版本
+                        - self.profiler : 测定初始参数
+                        - self.profiler_config : 初始测定配置
+            - (保存) self.worker = wrapper
+            - (调用) self.worker.init_device()
+                - (转发) self.worker.init_device()
+                    - 【worker初始化第一步】初始化设备 + 分布式上下文通信组 + model_runner(含InputBatch)
+                        - (保存) parallel_config = 并行化参数
+                        - (计算) tp_pp_world_size 计算所需GPU个数
+                        - (调用) 发布worker的逻辑rank id ~ GPU 映射表
+                        - (调用) 设置pytorch的device为对应的GPU
+                        - (调用) 拉起NCCL通信网络，做TP，PP，PCP，DP、EP、EPLB 组（EP/EPLB 仅 MoE 模型）分组切分
+                        - (调用) 设置随机种子
+                        - (调用) gc.collect()，CPU侧清理垃圾变量内存
+                        - (调用) torch.accelerator.empty_cache(), GPU侧清理垃圾变量显存
+                        - (调用) 测量实际可以显存 vs 用户预先设置请求的内存空间
+                        - (构造) 算子缓冲区的scratch草稿显存控制器 = init_workspace_manager()
+                            - 简单，待定
+                        - (构造) self.model_runner = GPUModelRunnerV1.init()
+                            - ...
+            - (调用) self.worker.load_model()
+                - (转发) 为空，转发Worker
+                    - 【worker初始化第二步】构造模型结构 + 加载权重(按 TP/PP 切分与设备放置) + model.eval() + 可选 graph包装
+                        - (调用) 把vllm.config设为当前的vllm_config
+                        - (调用) 调整cuda分配器的切片大小为20MB，用于分配权重显存
+                        - (调用)self.model_runner.load_model() 加载权重
+                            - (调用)实际测试设备内存
+                            - (调用) model_loader = get_model_loader() 获取模型加载器
+                            - (调用) self.model = model_loader.load_model() 加载模型
+                            - (调用) 加载lora模型
+                            - (调用) 加载草稿模型
+                            - (调用) (可选) 包装一层cuda graph
+        - (调用) ready_writer 发送 ready信号 + worker_response_mq的连接信息
+        - (调用) rpc_broadcast_mq.wait_until_ready() 验证我们发送通路的正常，作为reader接收方
+        - (调用) worker_response_mq.wait_until_ready() 验证我们回复通路的正常，作为writer发送方
+        - (调用) worker.worker_busy_loop() Worker进程的RPC服务循环
+            - 【loop】
+                - (保存) rpc_broadcast_mq.dequeue，得到method + args + output_rank
+                - (调用) 发给worker，调用method
+                    - WorkerWrapperBase适配器命中实现
+                    - WorkerWrapperBase适配器未命中
+                        - Worker.func实现
+
+
+WorkerProc
+    - .worker : WorkerWrapperBase （适配器转发层）
+        - .worker : Worker
+          - .device : torch.device
+          - .model_runner : nn.Module
+            - .model
+          - .rank = rank
+          - .distributed_init_method (执行器的联系方式)
+          - .profiler
+          - .profiler_config
