@@ -28,6 +28,8 @@ from enum import Enum, auto
 from multiprocessing import Process, get_context
 from multiprocessing.connection import Connection, wait as connection_wait
 
+import torch
+
 from my_vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from my_vllm.distributed.utils import get_open_port
 
@@ -357,8 +359,21 @@ class MultiprocExecutor:
         self.vllm_config = vllm_config
         self.parallel_config = vllm_config.parallel_config
         self.world_size = self.parallel_config.world_size
-        # 单机多卡：本机 worker 数 == world_size
+
+        # 单机多卡（当前只跑一个 DP 副本、无多节点）：本机 worker 数 == world_size
         self.local_world_size = self.world_size
+
+        # 校验 world_size 不超过本机实际 GPU 数；无 CUDA 时跳过（走 CPU 回退）
+        if torch.cuda.is_available():
+            num_gpus = torch.cuda.device_count()
+            if self.world_size > num_gpus:
+                raise RuntimeError(
+                    f"world_size={self.world_size} "
+                    f"(tp={self.parallel_config.tensor_parallel_size} × "
+                    f"pp={self.parallel_config.pipeline_parallel_size}) "
+                    f"超过本机 GPU 数 {num_gpus}，请调低 --tensor-parallel-size / "
+                    f"--pipeline-parallel-size"
+                )
 
         self.workers: list[WorkerProcHandle] = []
         self.response_mqs: list[MessageQueue] = []
