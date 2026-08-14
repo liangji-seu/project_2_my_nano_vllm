@@ -84,7 +84,7 @@ class EngineConfig:
             disable_log_stats=args.disable_log_stats,
             served_model_name=args.served_model_name,
             max_model_len=args.max_model_len,
-            data_parallel_size=getattr(args, "data_parallel_size", 1),
+            data_parallel_size=getattr(args, "dp_size", 1),
             enable_log_requests=getattr(args, "enable_log_requests", False),
             seed=getattr(args, "seed", 0),
             block_size=getattr(args, "block_size", 16),
@@ -93,8 +93,8 @@ class EngineConfig:
             max_num_seqs=getattr(args, "max_num_seqs", 32),
             max_num_batched_tokens=getattr(args, "max_num_batched_tokens", 2048),
             parallel_config=ParallelConfig(
-                tensor_parallel_size=getattr(args, "tensor_parallel_size", 1),
-                pipeline_parallel_size=getattr(args, "pipeline_parallel_size", 1),
+                tensor_parallel_size=getattr(args, "tp_size", 1),
+                pipeline_parallel_size=getattr(args, "pp_size", 1),
             ),
         )
 
@@ -136,19 +136,19 @@ def make_arg_parser() -> argparse.ArgumentParser:
         help="启用请求日志",
     )
     parser.add_argument(
-        "--data-parallel-size",
+        "--dp-size",
         type=int,
         default=1,
-        help="数据并行度（引擎后端进程数）",
+        help="数据并行度（DP，引擎后端进程数）",
     )
     parser.add_argument(
-        "--tensor-parallel-size",
+        "--tp-size",
         type=int,
         default=1,
         help="张量并行度（TP，一张模型切到几张卡）",
     )
     parser.add_argument(
-        "--pipeline-parallel-size",
+        "--pp-size",
         type=int,
         default=1,
         help="流水线并行度（PP，模型按层切到几个 stage）",
