@@ -145,7 +145,7 @@ class AsyncLLM:
         )
 
         # 通过 ZMQ 发送到引擎后端, 等待返回
-        result = await self.mp_client.generate(prompt)
+        result = await self.mp_client.generate(prompt, max_tokens=max_tokens)
         logger.info("推理完成: result=%.50s...", result)
         return result
 

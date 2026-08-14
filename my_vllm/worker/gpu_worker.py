@@ -71,9 +71,17 @@ class Worker(WorkerBase):
         # vLLM 里 local_rank 是「逻辑 id」，还要经过 assigned_physical_gpu_ids
         # 映射成「物理 id」；单机时两者一一对应，这里直接取 local_rank。
         visible_device_index = self.local_rank
-        self.device = torch.device(f"cuda:{visible_device_index}")
-        # 真正把本进程绑定到这张卡（torch.device() 只是描述符，无副作用）
-        torch.cuda.set_device(self.device)
+        if torch.cuda.is_available():
+            self.device = torch.device(f"cuda:{visible_device_index}")
+            # 真正把本进程绑定到这张卡（torch.device() 只是描述符，无副作用）
+            torch.cuda.set_device(self.device)
+        else:
+            # 无 GPU：回退到 CPU 设备，便于本地无卡环境跑通整条 RPC 链路
+            self.device = torch.device("cpu")
+            logger.warning(
+                "未检测到 CUDA，Worker rank=%d 使用 CPU 设备（本地无卡调试模式）",
+                self.rank,
+            )
 
         # 2. 拉起 NCCL：先 world 组，再切分 TP/PP 组
         self._init_worker_distributed_environment()
@@ -105,12 +113,14 @@ class Worker(WorkerBase):
         world_size = parallel_config.world_size
 
         # world 组：一个模型副本的所有 worker 进程互相握手
+        # 有 GPU 用 NCCL，无 GPU 用 gloo（CPU 后端，本地无卡可跑）
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
         init_distributed_environment(
             world_size=world_size,
             rank=self.rank,
             distributed_init_method=self.distributed_init_method,
             local_rank=self.local_rank,
-            backend="nccl",
+            backend=backend,
         )
         # TP/PP 子组：按 rank 切分（预留并行优化）
         init_model_parallel_group(

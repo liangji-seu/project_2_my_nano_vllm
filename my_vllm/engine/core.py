@@ -320,7 +320,7 @@ class EngineCoreProc(EngineCore):
           while is_running:
             1. _process_input_queue()  — 把 input_queue 里的请求转成 Request 交给 scheduler
             2. scheduler.schedule()    — 选出本轮要算的请求 + 分配 KV cache
-            3. executor.execute_model()— 执行前向 + 采样（ModelRunner 未实现，暂用 mock）
+            3. executor.execute_model()— collective_rpc 广播给 worker 执行前向 + 采样
             4. scheduler.update_from_output() — 推进请求状态 / 判定结束
             5. _send_finished_outputs()       — 把已结束请求的结果送回前端
         """
@@ -337,10 +337,20 @@ class EngineCoreProc(EngineCore):
             # 2) 调度：选出本轮要执行的请求
             scheduler_output = self.scheduler.schedule()
 
-            # 3) 执行：真实实现走 self.model_executor.execute_model()；
-            #    ModelRunner.forward 尚未实现，暂用确定性 mock 采样占位。
+            # 3) 执行：通过 executor.collective_rpc 把 scheduler_output 广播给所有
+            #    worker，worker 执行「前向 + 采样」后回传 ModelRunnerOutput。
+            #    （worker 侧 forward 目前是 mock，见 GPUModelRunner.execute_model）
             if scheduler_output.total_num_scheduled_tokens > 0:
-                model_runner_output = self._execute_model(scheduler_output)
+                model_runner_output = self.model_executor.execute_model(scheduler_output)
+                # 调试日志：打印本轮 collective_rpc 回传的采样结果，直观确认执行器链路生效
+                sampled_text = {
+                    rid: "".join(chr(t) for t in ids)
+                    for rid, ids in zip(
+                        model_runner_output.req_ids,
+                        model_runner_output.sampled_token_ids,
+                    )
+                }
+                logger.info("[RPC] execute_model 本轮采样结果: %s", sampled_text)
                 self.scheduler.update_from_output(scheduler_output, model_runner_output)
 
             # 4) 回传已结束请求的输出
@@ -378,28 +388,6 @@ class EngineCoreProc(EngineCore):
             request_id=raw["request_id"],
             prompt_token_ids=prompt_token_ids,
             sampling_params=SamplingParams(max_tokens=max_tokens),
-        )
-
-    def _execute_model(self, scheduler_output: "SchedulerOutput") -> "ModelRunnerOutput":
-        """执行一次前向 + 采样，返回每个请求本轮采出的 token
-
-        TODO: 替换为真实实现 self.model_executor.execute_model(scheduler_output)。
-        在 ModelRunner.forward 骨架实现前，用确定性 mock 采样占位：
-        每个请求每步生成一个可打印字符，保证主循环能跑通、请求能正常结束。
-        """
-        from my_vllm.v1.core.sched.output import ModelRunnerOutput
-
-        req_ids = list(scheduler_output.num_scheduled_tokens.keys())
-        sampled_token_ids: list[list[int]] = []
-        for req_id in req_ids:
-            request = self.scheduler.requests[req_id]
-            # 确定性「采样」：根据已生成长度轮转 a..z，避免 control 字符污染输出
-            token_id = ord("a") + (request.num_output_tokens % 26)
-            sampled_token_ids.append([token_id])
-        return ModelRunnerOutput(
-            req_ids=req_ids,
-            sampled_token_ids=sampled_token_ids,
-            req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
         )
 
     def _send_finished_outputs(self) -> None:

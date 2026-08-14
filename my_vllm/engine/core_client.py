@@ -320,7 +320,7 @@ class MPClient:
 
     # ---- 推理接口 ----
 
-    async def generate(self, prompt: str) -> str:
+    async def generate(self, prompt: str, max_tokens: int = 100) -> str:
         """发送推理请求到引擎后端, 等待返回结果
 
         流程:
@@ -330,6 +330,7 @@ class MPClient:
 
         Args:
             prompt: 文本 prompt（后续扩展为完整的 EngineCoreRequest）
+            max_tokens: 最大生成 token 数
 
         Returns:
             引擎生成的文本
@@ -341,6 +342,7 @@ class MPClient:
         request = {
             "request_id": request_id,
             "prompt": prompt,
+            "max_tokens": max_tokens,
         }
 
         # 创建 Future 用于等待结果
