@@ -74,16 +74,16 @@ class Scheduler:
         # prompt 超长直接忽略（对应 vLLM 的 FINISHED_IGNORED）
         if request.num_prompt_tokens > self.max_model_len:
             request.status = RequestStatus.FINISHED_IGNORED
-            self.requests[request.request_id] = request
-            self.finished_req_ids.add(request.request_id)
+            self.requests[request.request_id] = request # 调度器的总表目记录一下
+            self.finished_req_ids.add(request.request_id) # 然后直接加入已经完成的req
             logger.warning(
                 "请求 %s prompt 超长（%d > %d），忽略",
                 request.request_id, request.num_prompt_tokens, self.max_model_len,
             )
             return
 
-        self.requests[request.request_id] = request
-        self.waiting.append(request)
+        self.requests[request.request_id] = request # 调度器的总表目记录一下
+        self.waiting.append(request)                # 加入waiting队列， 这里发过来的肯定都是没有处理过，都是prompt的req
         logger.debug("请求 %s 已入队 (num_prompt_tokens=%d)", request.request_id,
                      request.num_prompt_tokens)
 
@@ -115,13 +115,13 @@ class Scheduler:
         """
         self.current_step += 1
 
-        scheduled_new_reqs: list[Request] = []
-        scheduled_running_reqs: list[Request] = []
-        preempted_reqs: list[Request] = []
+        scheduled_new_reqs: list[Request] = []      # 本轮的新req的名单
+        scheduled_running_reqs: list[Request] = []  # 本轮继续的req的名单
+        preempted_reqs: list[Request] = []          # 本轮被抢占掉的名单（不运行，回到waiting了）
 
-        req_to_new_blocks: dict[str, list[int]] = {}
-        num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
+        req_to_new_blocks: dict[str, list[int]] = {} # 本轮的req需要的新的block的页表
+        num_scheduled_tokens: dict[str, int] = {}    # 本轮每个req所需要计算的token数（prompt长度的，chunked长度的，1token长度的）
+        token_budget = self.max_num_scheduled_tokens # 本轮token预算
 
         # ---- 阶段 1：RUNNING 遍历 ----
         req_index = 0
@@ -151,7 +151,7 @@ class Scheduler:
                 if new_blocks is not None:
                     break
 
-                victim = self._pick_preempt_victim(scheduled_running_reqs)
+                victim = self._pick_preempt_victim(scheduled_running_reqs) # 传入已经调度的表，是为了排除掉他们
                 if victim is None:
                     new_blocks = None
                     break
@@ -176,24 +176,38 @@ class Scheduler:
         # ---- 阶段 2：WAITING 遍历（本轮有抢占则跳过，避免重复调度）----
         if not preempted_reqs:
             while (
-                self.waiting
+                self.waiting # 全新的req, 被抢占过来的req:(prompt+output, chunked_prompt, prompt)
                 and token_budget > 0
                 and len(self.running) < self.max_num_running_reqs
             ):
                 request = self.waiting[0]
                 req_id = request.request_id
 
+                '''
+                waiting队列里面只有3种req
+                请求类型	              KV cache	   num_computed_tokens
+                从未调度过	                无	            == 0
+                被抢占赶回（recompute）	    已释放	         == 0（2038 行清零）
+                PD 分离·远端 KV 传输完成	有（远端搬入）	  != 0
+
+            
+                你原来的两分法漏了第三类。num_computed_tokens != 0 说的不是「有 prompt+output 但没 KV」的抢占请求，
+                而是「KV 已经通过 connector 从 prefill 实例搬过来了」的 disaggregation 请求——它的 KV 是在的。
+
+                你正在看的 partial_tail_offloads（output.py:312）也属于这条 KV connector 链路。
+                '''
                 # 前缀缓存查询（仅第一次调度；被抢占恢复的请求 computed 已归零）
                 if request.num_computed_tokens == 0:
                     new_computed_blocks, num_hit_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
-                else:
+                else: # ----- 这里是给KVTransfer PD分离用的 -----
+                    # 这里num_computed_tokens !=0, 表示这个req的prefill的kvcache,在远端计算好了
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_hit_tokens = 0
 
-                num_computed_tokens = num_hit_tokens
-                num_new_tokens = request.num_tokens - num_computed_tokens
+                num_computed_tokens = num_hit_tokens # prefix前缀缓存命中的token数
+                num_new_tokens = request.num_tokens - num_computed_tokens # 后续还要计算的token数
                 num_new_tokens = min(
                     num_new_tokens,
                     token_budget,
@@ -204,7 +218,7 @@ class Scheduler:
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
-                    num_new_tokens,
+                    num_new_tokens, # 需要计算的tokens
                     num_new_computed_tokens=num_hit_tokens,
                     new_computed_blocks=new_computed_blocks,
                 )
@@ -222,34 +236,42 @@ class Scheduler:
                 req_to_new_blocks[req_id] = (
                     self.kv_cache_manager.get_block_ids(req_id)[0]
                 )
-                num_scheduled_tokens[req_id] = num_new_tokens
+                num_scheduled_tokens[req_id] = num_new_tokens # 本轮的新req，需要完成prefix除了命中的剩余的tokens数
                 token_budget -= num_new_tokens
 
         # ---- 阶段 3：构造输出 ----
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
 
-        new_reqs_data = [
+        new_reqs_data = [ # 本轮新增的req的请求集合
             NewRequestData(
-                req_id=r.request_id,
-                prompt_token_ids=r.prompt_token_ids,
-                block_ids=(req_to_new_blocks[r.request_id],),
-                num_computed_tokens=r.num_computed_tokens,
-                max_tokens=r.max_tokens,
+                req_id=r.request_id, # 每个请求的ID
+                prompt_token_ids=r.prompt_token_ids, # 每个req的 原始 prompt 的 token ids 序列 #
+                block_ids=(req_to_new_blocks[r.request_id],), # 每个req的新占用的block的列表
+                num_computed_tokens=r.num_computed_tokens, # 每个req的已经计算的tokens数量
+                max_tokens=r.max_tokens, # 这个req的最大总长度
             )
             for r in scheduled_new_reqs
         ]
 
         cached_reqs_data = self._make_cached_request_data(
             scheduled_running_reqs, num_scheduled_tokens, req_to_new_blocks
+            # 本轮继续运行的req集合，每个req的本轮的计算tokens数量，每个req的本轮新增的block列表
         )
 
         scheduler_output = SchedulerOutput(
-            scheduled_new_reqs=new_reqs_data,
-            scheduled_cached_reqs=cached_reqs_data,
-            num_scheduled_tokens=num_scheduled_tokens,
-            total_num_scheduled_tokens=total_num_scheduled_tokens,
-            finished_req_ids=set(self.finished_req_ids),
-            num_common_prefix_blocks=self.kv_cache_manager.get_num_common_prefix_blocks(
+            scheduled_new_reqs=new_reqs_data, # 本轮新增的req的集合
+            scheduled_cached_reqs=cached_reqs_data, # 本轮的继续running的req集合
+            num_scheduled_tokens=num_scheduled_tokens, # 这边传入的本轮的每个req需要计算的token数
+
+            total_num_scheduled_tokens=total_num_scheduled_tokens, # batch的总共tokens数
+            finished_req_ids=set(self.finished_req_ids), # 上一轮update_from_output里面判定已经执行结束了，这次也通知一下worker
+
+            # 这一批的req之间，互相共享的 公共前缀长度；不是各自命中前缀缓存的最大值
+            # 这里是为了cascade attention， 这是本轮batch，他们都面临同样的K矩阵，V矩阵，对于这个公共前缀长度
+
+            # num_common_prefix_blocks 这个量本身是 prefix cache 的产物（共享 block 的计数），但它服务的用途是 cascade attention（省 attention 算力）。
+            # 两者解决的是 attention 流水线上不同阶段的两段重复——一个是「KV 别重复生成」，一个是「共享的 KV 别重复 attend」。
+            num_common_prefix_blocks=self.kv_cache_manager.get_num_common_prefix_blocks( # running 队列里所有请求共同的最长公共前缀 block 数
                 self.running[0].request_id if self.running else ""
             ),
         )
@@ -312,7 +334,7 @@ class Scheduler:
     # ==================================================================
     # 内部辅助
     # ==================================================================
-
+    # 先暂时更新
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         """调度已提交，推进每个请求的 num_computed_tokens
 
@@ -321,7 +343,7 @@ class Scheduler:
         """
         for req_id, num_scheduled in scheduler_output.num_scheduled_tokens.items():
             request = self.requests[req_id]
-            request.num_computed_tokens += num_scheduled
+            request.num_computed_tokens += num_scheduled # 算上这次已经计算的
 
     def _pick_preempt_victim(
         self, scheduled_running_reqs: list[Request]
@@ -355,10 +377,10 @@ class Scheduler:
         req_to_new_blocks: dict[str, list[int]],
     ) -> CachedRequestData:
         """构造老请求的增量数据"""
-        req_ids = [r.request_id for r in scheduled_running_reqs]
-        new_block_ids = [tuple([req_to_new_blocks[r.request_id]]) for r in scheduled_running_reqs]
-        num_computed = [r.num_computed_tokens for r in scheduled_running_reqs]
-        num_scheduled = [num_scheduled_tokens[r.request_id] for r in scheduled_running_reqs]
+        req_ids = [r.request_id for r in scheduled_running_reqs] # 本轮继续的req的集合
+        new_block_ids = [tuple([req_to_new_blocks[r.request_id]]) for r in scheduled_running_reqs] # 本轮的继续req的新block数
+        num_computed = [r.num_computed_tokens for r in scheduled_running_reqs] # 本轮继续的req的已经计算过kvcache的token数
+        num_scheduled = [num_scheduled_tokens[r.request_id] for r in scheduled_running_reqs] # 本轮继续req，在这一轮需要计算的token数
         return CachedRequestData(
             req_ids=req_ids,
             new_block_ids=new_block_ids,
