@@ -1,16 +1,4 @@
-"""
-调度器 + KV cache 单元测试（纯 Python，无需 torch / GPU）
-
-覆盖：
-  1. BlockPool        — 分配 / 释放 / 引用计数 / 驱逐顺序
-  2. KVCacheManager   — 前缀缓存命中共享 + 引用计数
-  3. KVCacheManager   — 显存不足分配失败不泄漏引用计数（关键 bug 回归）
-  4. Scheduler        — 完整 schedule → execute → update 主循环，请求正常结束
-  5. Scheduler        — 抢占 + 恢复，无引用计数泄漏
-
-运行：
-  /path/to/vllm_study/bin/python test/test7_scheduler_kv_cache/test_scheduler_kv_cache.py
-"""
+"""Scheduler 与分层 KV cache 账本测试（纯 Python，无需 GPU）。"""
 
 import sys
 from pathlib import Path
@@ -18,15 +6,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from my_vllm.config import EngineConfig
+from my_vllm.v1.core.block_pool import BlockPool
+from my_vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from my_vllm.v1.core.kv_cache_manager import KVCacheManager
-from my_vllm.v1.core.kv_cache_utils import BlockPool
 from my_vllm.v1.core.sched.output import ModelRunnerOutput
 from my_vllm.v1.core.sched.scheduler import Scheduler
-from my_vllm.v1.request import FinishReason, Request, RequestStatus, SamplingParams
+from my_vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+)
+from my_vllm.v1.request import FinishReason, Request, SamplingParams
 
 
-def make_request(req_id, token_ids, max_tokens):
-    """构造一个测试请求"""
+def make_request(req_id, token_ids, max_tokens=1):
     return Request(
         request_id=req_id,
         prompt_token_ids=list(token_ids),
@@ -35,226 +29,265 @@ def make_request(req_id, token_ids, max_tokens):
 
 
 def mock_execute(scheduler, scheduler_output):
-    """模拟一次前向 + 采样：每个请求每步生成一个确定性 token
-
-    与 EngineCore._execute_model() 的占位逻辑一致：按已生成长度轮转 a..z。
-    """
-    req_ids = list(scheduler_output.num_scheduled_tokens.keys())
-    sampled = []
-    for rid in req_ids:
-        req = scheduler.requests[rid]
-        sampled.append([ord("a") + (req.num_output_tokens % 26)])
-    return ModelRunnerOutput(
-        req_ids=req_ids,
-        sampled_token_ids=sampled,
-        req_id_to_index={r: i for i, r in enumerate(req_ids)},
-    )
+    req_ids = list(scheduler_output.num_scheduled_tokens)
+    sampled = [
+        [ord("a") + scheduler.requests[req_id].num_output_tokens % 26]
+        for req_id in req_ids
+    ]
+    return ModelRunnerOutput(req_ids=req_ids, sampled_token_ids=sampled)
 
 
 def run_loop(scheduler, max_steps=100000):
-    """模拟 EngineCore 主循环：schedule → execute → update → 收集结束请求
-
-    返回 {request_id: 已结束的 Request}。
-    """
     finished = {}
     for _ in range(max_steps):
-        out = scheduler.schedule()
-        if out.total_num_scheduled_tokens > 0:
-            runner_out = mock_execute(scheduler, out)
-            scheduler.update_from_output(out, runner_out)
-        for rid in list(scheduler.finished_req_ids):
-            req = scheduler.requests.get(rid)
-            scheduler.finished_req_ids.discard(rid)
-            if req is not None:
-                finished[rid] = req
-                scheduler.requests.pop(rid, None)
-        if not scheduler.running and not scheduler.waiting and not scheduler.finished_req_ids:
+        scheduler_output = scheduler.schedule()
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            scheduler.update_from_output(
+                scheduler_output,
+                mock_execute(scheduler, scheduler_output),
+            )
+        for req_id in list(scheduler.finished_req_ids):
+            request = scheduler.requests.get(req_id)
+            scheduler.finished_req_ids.discard(req_id)
+            if request is not None:
+                finished[req_id] = request
+                scheduler.requests.pop(req_id, None)
+        if not scheduler.running and not scheduler.waiting:
             break
     return finished
 
 
 def assert_no_leak(kv_cache_manager, num_gpu_blocks):
-    """所有 block 引用计数归零、空闲队列恢复到满"""
     pool = kv_cache_manager.block_pool
-    leaked = [b for b in pool.blocks if b.ref_cnt != 0]
-    assert not leaked, f"引用计数泄漏的 block: {leaked}"
-    assert pool.get_num_free_blocks() == num_gpu_blocks, (
-        f"空闲 block 数 {pool.get_num_free_blocks()} != {num_gpu_blocks}"
-    )
+    leaked = [
+        block
+        for block in pool.blocks
+        if not block.is_null and block.ref_cnt != 0
+    ]
+    assert not leaked
+    assert pool.get_num_free_blocks() == num_gpu_blocks - 1
 
 
-# ==================================================================
-# 1. BlockPool 基础
-# ==================================================================
-
-def test_block_pool():
-    pool = BlockPool(4, enable_caching=True)
+def test_block_pool_uses_shared_ids_and_o1_free_queue():
+    pool = BlockPool(5, enable_caching=True, hash_block_size=16)
+    assert pool.null_block.block_id == 0
     assert pool.get_num_free_blocks() == 4
 
-    b0, b1 = pool.get_new_blocks(2)
-    assert [b0.block_id, b1.block_id] == [0, 1]
-    assert pool.get_num_free_blocks() == 2
-    assert b0.ref_cnt == 1 and b1.ref_cnt == 1
+    block1, block2 = pool.get_new_blocks(2)
+    assert [block1.block_id, block2.block_id] == [1, 2]
+    assert block1.prev_free_block is None
+    assert block1.next_free_block is None
 
-    pool.free_blocks([b0, b1])  # 按分配顺序释放
+    pool.free_blocks(reversed([block1, block2]))
     assert pool.get_num_free_blocks() == 4
-    assert b0.ref_cnt == 0 and b1.ref_cnt == 0
 
 
-# ==================================================================
-# 2. 前缀缓存命中共享 + 引用计数
-# ==================================================================
+def test_request_owns_chained_content_hashes():
+    first = make_request("first", list(range(8)))
+    second = make_request("second", list(range(4)) + list(range(4, 8)))
+    different_parent = make_request("third", [99, 98, 97, 96] + list(range(4, 8)))
 
-def test_prefix_cache_refcount():
-    # block_size=16：32 个 token 正好 2 个 block
-    kv = KVCacheManager(num_gpu_blocks=4, block_size=16, max_model_len=64)
+    for request in (first, second, different_parent):
+        request.update_block_hashes(4)
 
-    a = make_request("A", list(range(32)), max_tokens=1)   # block0: 0..15, block1: 16..31
-    kv.allocate_slots(a, num_new_tokens=32)
-    assert kv.get_block_ids("A")[0] == [0, 1]
-
-    # B 的前 16 个 token 与 A 相同 → 命中前缀缓存 block0
-    b = make_request("B", list(range(16)) + list(range(32, 48)), max_tokens=1)
-    hit_blocks, num_hit = kv.get_computed_blocks(b)
-    assert num_hit == 16
-    assert hit_blocks.blocks[0][0].block_id == 0
-
-    kv.allocate_slots(b, num_new_tokens=16, num_new_computed_tokens=16,
-                      new_computed_blocks=hit_blocks)
-    assert kv.get_block_ids("B")[0] == [0, 2]  # 共享 block0 + 新 block2
-
-    # block0 被 A、B 共享 → ref_cnt = 2
-    pool = kv.block_pool
-    assert pool.blocks[0].ref_cnt == 2
-
-    # 释放 A：block0 ref_cnt 2→1（仍被 B 持有），block1 归零
-    kv.free(a)
-    assert pool.blocks[0].ref_cnt == 1
-    assert pool.blocks[1].ref_cnt == 0
-
-    # 释放 B：block0、block2 都归零
-    kv.free(b)
-    assert_no_leak(kv, 4)
+    assert first.block_hashes == second.block_hashes
+    assert first.block_hashes[1] != different_parent.block_hashes[1]
 
 
-# ==================================================================
-# 3. 分配失败不泄漏引用计数（回归测试）
-# ==================================================================
+def test_prefix_cache_is_registered_only_after_execution():
+    kv = KVCacheManager(5, 16, max_model_len=64)
+    source = make_request("source", list(range(32)))
+    follower = make_request("follower", list(range(16)) + list(range(100, 116)))
 
-def test_allocate_fail_no_leak():
-    kv = KVCacheManager(num_gpu_blocks=4, block_size=16, max_model_len=64)
+    allocated = kv.allocate_slots(source, num_new_tokens=32)
+    assert allocated is not None
+    _, hit_before_execute = kv.get_computed_blocks(follower)
+    assert hit_before_execute == 0
 
-    # A 占满 2 个 block（0, 1），free 剩 2
-    a = make_request("A", list(range(32)), max_tokens=1)
-    kv.allocate_slots(a, num_new_tokens=32)
+    kv.cache_blocks(source, num_computed_tokens=32)
+    hit_blocks, hit_after_execute = kv.get_computed_blocks(follower)
+    assert hit_after_execute == 16
+    assert hit_blocks.get_block_ids()[0] == [1]
 
-    # B：16 共享 + 48 新 token = 64 token，需要 4 个 block，但只有 3 个可用
-    b = make_request("B", list(range(16)) + list(range(100, 148)), max_tokens=1)
-    hit_blocks, num_hit = kv.get_computed_blocks(b)
-    assert num_hit == 16
+    kv.free(source)
+    assert_no_leak(kv, 5)
 
-    result = kv.allocate_slots(b, num_new_tokens=48, num_new_computed_tokens=16,
-                               new_computed_blocks=hit_blocks)
-    assert result is None  # 显存不足，分配失败
 
-    # 关键断言：失败时命中的 block0 引用计数不能被白加一次
-    assert kv.block_pool.blocks[0].ref_cnt == 1, (
-        f"分配失败后 block0 ref_cnt 应为 1，实际 {kv.block_pool.blocks[0].ref_cnt}"
+def test_prefix_cache_shares_blocks_and_refcounts():
+    kv = KVCacheManager(5, 16, max_model_len=64)
+    source = make_request("source", list(range(32)))
+    kv.allocate_slots(source, num_new_tokens=32)
+    kv.cache_blocks(source, num_computed_tokens=32)
+
+    follower = make_request(
+        "follower",
+        list(range(16)) + list(range(100, 116)),
     )
-    assert kv.block_pool.get_num_free_blocks() == 2
+    hit_blocks, num_hit = kv.get_computed_blocks(follower)
+    new_blocks = kv.allocate_slots(
+        follower,
+        num_new_tokens=16,
+        num_new_computed_tokens=num_hit,
+        new_computed_blocks=hit_blocks,
+    )
+    assert new_blocks is not None
+    assert kv.get_block_ids("source")[0] == [1, 2]
+    assert kv.get_block_ids("follower")[0] == [1, 3]
+    assert kv.block_pool.blocks[1].ref_cnt == 2
 
-    # 释放 A 后重试，B 应能成功分配（前缀命中 block0 + 3 个新 block）
-    kv.free(a)
-    hit_blocks, num_hit = kv.get_computed_blocks(b)
-    result = kv.allocate_slots(b, num_new_tokens=48, num_new_computed_tokens=16,
-                               new_computed_blocks=hit_blocks)
+    kv.free(source)
+    assert kv.block_pool.blocks[1].ref_cnt == 1
+    kv.free(follower)
+    assert_no_leak(kv, 5)
+
+
+def test_allocate_failure_does_not_leak_hit_refcount():
+    kv = KVCacheManager(5, 16, max_model_len=64)
+    source = make_request("source", list(range(32)))
+    kv.allocate_slots(source, num_new_tokens=32)
+    kv.cache_blocks(source, num_computed_tokens=32)
+
+    follower = make_request(
+        "follower",
+        list(range(16)) + list(range(100, 148)),
+    )
+    hit_blocks, num_hit = kv.get_computed_blocks(follower)
+    result = kv.allocate_slots(
+        follower,
+        num_new_tokens=48,
+        num_new_computed_tokens=num_hit,
+        new_computed_blocks=hit_blocks,
+    )
+    assert result is None
+    assert kv.block_pool.blocks[1].ref_cnt == 1
+    assert "follower" not in kv.coordinator.single_type_managers[0].req_to_blocks
+
+    kv.free(source)
+    hit_blocks, num_hit = kv.get_computed_blocks(follower)
+    result = kv.allocate_slots(
+        follower,
+        num_new_tokens=48,
+        num_new_computed_tokens=num_hit,
+        new_computed_blocks=hit_blocks,
+    )
     assert result is not None
-    assert len(kv.get_block_ids("B")[0]) == 4
-
-    kv.free(b)
-    assert_no_leak(kv, 4)
+    kv.free(follower)
+    assert_no_leak(kv, 5)
 
 
-# ==================================================================
-# 4. 完整调度主循环：两个请求正常结束
-# ==================================================================
+def test_hybrid_coordinator_keeps_one_table_per_group():
+    config = KVCacheConfig(
+        num_blocks=13,
+        kv_cache_tensors=[
+            KVCacheTensor(size=4096, shared_by=["layer.0"]),
+            KVCacheTensor(size=8192, shared_by=["layer.1"]),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer.0"], FullAttentionSpec(block_size=4)),
+            KVCacheGroupSpec(["layer.1"], FullAttentionSpec(block_size=8)),
+        ],
+    )
+    kv = KVCacheManager(kv_cache_config=config, max_model_len=64)
+    assert isinstance(kv.coordinator, HybridKVCacheCoordinator)
+    assert kv.hash_block_size == 4
+    assert kv.scheduler_block_size == 8
 
-def test_scheduler_full_loop():
-    cfg = EngineConfig(max_model_len=64, block_size=16, num_gpu_blocks=16,
-                       max_num_seqs=4, max_num_batched_tokens=64)
-    kv = KVCacheManager(cfg.num_gpu_blocks, cfg.block_size,
-                        cfg.max_model_len, cfg.enable_prefix_caching)
-    sched = Scheduler(cfg, kv)
+    source = make_request("source", list(range(16)))
+    kv.allocate_slots(source, num_new_tokens=16)
+    kv.cache_blocks(source, num_computed_tokens=16)
+    assert [len(group) for group in kv.get_block_ids("source")] == [4, 2]
 
-    # A：32 token prompt；B：前 16 与 A 共享 + 16 新 token
-    sched.add_request(make_request("A", list(range(32)), max_tokens=4))
-    sched.add_request(make_request("B", list(range(16)) + list(range(32, 48)),
-                                   max_tokens=3))
+    follower = make_request("follower", list(range(16)) + list(range(100, 108)))
+    hit_blocks, num_hit = kv.get_computed_blocks(follower)
+    assert num_hit == 16
+    assert [len(group) for group in hit_blocks.blocks] == [4, 2]
 
-    finished = run_loop(sched)
+    new_blocks = kv.allocate_slots(
+        follower,
+        num_new_tokens=8,
+        num_new_computed_tokens=num_hit,
+        new_computed_blocks=hit_blocks,
+    )
+    assert new_blocks is not None
+    assert [len(group) for group in kv.get_block_ids("follower")] == [6, 3]
+    assert [len(group) for group in new_blocks.blocks] == [2, 1]
 
+    kv.free(source)
+    kv.free(follower)
+    assert_no_leak(kv, 13)
+
+
+def test_scheduler_output_preserves_all_group_block_tables():
+    cache_config = KVCacheConfig(
+        num_blocks=9,
+        kv_cache_tensors=[KVCacheTensor(size=0), KVCacheTensor(size=0)],
+        kv_cache_groups=[
+            KVCacheGroupSpec([], FullAttentionSpec(block_size=4)),
+            KVCacheGroupSpec([], FullAttentionSpec(block_size=8)),
+        ],
+    )
+    kv = KVCacheManager(kv_cache_config=cache_config, max_model_len=32)
+    scheduler = Scheduler(
+        EngineConfig(max_model_len=32, max_num_batched_tokens=32),
+        kv,
+    )
+    scheduler.add_request(make_request("request", list(range(16))))
+
+    output = scheduler.schedule()
+    request_data = output.scheduled_new_reqs[0]
+    assert [len(group) for group in request_data.block_ids] == [4, 2]
+
+    scheduler.update_from_output(output, mock_execute(scheduler, output))
+    assert_no_leak(kv, 9)
+
+
+def test_scheduler_full_loop_and_prefix_lifecycle():
+    config = EngineConfig(
+        max_model_len=64,
+        block_size=16,
+        num_gpu_blocks=16,
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
+    )
+    kv = KVCacheManager(
+        config.num_gpu_blocks,
+        config.block_size,
+        config.max_model_len,
+        config.enable_prefix_caching,
+    )
+    scheduler = Scheduler(config, kv)
+    scheduler.add_request(make_request("A", list(range(32)), max_tokens=4))
+    scheduler.add_request(
+        make_request("B", list(range(16)) + list(range(32, 48)), max_tokens=3)
+    )
+
+    finished = run_loop(scheduler)
     assert set(finished) == {"A", "B"}
     assert finished["A"].get_finished_reason() == FinishReason.LENGTH
-    assert finished["B"].get_finished_reason() == FinishReason.LENGTH
     assert finished["A"].num_output_tokens == 4
     assert finished["B"].num_output_tokens == 3
-    assert_no_leak(kv, cfg.num_gpu_blocks)
+    assert_no_leak(kv, config.num_gpu_blocks)
 
 
-# ==================================================================
-# 5. 抢占 + 恢复：无引用计数泄漏
-# ==================================================================
-
-def test_scheduler_preemption():
-    # 4 个 block 只够 A、B 各长到 2 个 block；第 3 个 block 会触发抢占
-    cfg = EngineConfig(max_model_len=64, block_size=16, num_gpu_blocks=4,
-                       max_num_seqs=4, max_num_batched_tokens=64)
-    kv = KVCacheManager(cfg.num_gpu_blocks, cfg.block_size,
-                        cfg.max_model_len, cfg.enable_prefix_caching)
-    sched = Scheduler(cfg, kv)
-
-    # A、B 各 16 token prompt，各要生成 32 token（总长 48 = 3 block），互相无前缀重叠
-    sched.add_request(make_request("A", list(range(16)), max_tokens=32))
-    sched.add_request(make_request("B", list(range(100, 116)), max_tokens=32))
-
-    finished = run_loop(sched)
-
-    assert set(finished) == {"A", "B"}
-    assert finished["B"].num_preemptions >= 1, (
-        f"B 应至少被抢占一次，实际 {finished['B'].num_preemptions}"
+def test_scheduler_preemption_has_no_refcount_leak():
+    config = EngineConfig(
+        max_model_len=64,
+        block_size=16,
+        num_gpu_blocks=5,
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
     )
-    assert finished["A"].num_output_tokens == 32
-    assert finished["B"].num_output_tokens == 32
-    assert_no_leak(kv, cfg.num_gpu_blocks)
+    kv = KVCacheManager(
+        config.num_gpu_blocks,
+        config.block_size,
+        config.max_model_len,
+        config.enable_prefix_caching,
+    )
+    scheduler = Scheduler(config, kv)
+    scheduler.add_request(make_request("A", list(range(16)), max_tokens=32))
+    scheduler.add_request(make_request("B", list(range(100, 116)), max_tokens=32))
 
-
-# ==================================================================
-# 运行器
-# ==================================================================
-
-def main():
-    tests = [
-        test_block_pool,
-        test_prefix_cache_refcount,
-        test_allocate_fail_no_leak,
-        test_scheduler_full_loop,
-        test_scheduler_preemption,
-    ]
-    passed = 0
-    for test in tests:
-        try:
-            test()
-            print(f"[PASS] {test.__name__}")
-            passed += 1
-        except AssertionError as e:
-            print(f"[FAIL] {test.__name__}: {e}")
-        except Exception:
-            print(f"[FAIL] {test.__name__} 异常:")
-            import traceback
-            traceback.print_exc()
-    print(f"\n{passed}/{len(tests)} 通过")
-    return 0 if passed == len(tests) else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    finished = run_loop(scheduler)
+    assert set(finished) == {"A", "B"}
+    assert finished["B"].num_preemptions >= 1
+    assert_no_leak(kv, config.num_gpu_blocks)

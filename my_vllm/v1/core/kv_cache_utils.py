@@ -1,187 +1,127 @@
-"""
-KV cache 物理块基础设施 — KVCacheBlock + FreeKVCacheBlockQueue + BlockPool
+"""KV cache 的 block 元数据、链式哈希键和空闲链表。"""
 
-对应 vLLM 的 vllm/v1/core/kv_cache_utils.py + block_pool.py（大幅简化版）。
-
-核心概念：
-  - 把 GPU 上的一大块 KV cache 显存切成等大的「block」，每个 block 装 block_size 个 token 的 KV。
-  - BlockPool 统一管理这些 block 的分配 / 释放 / 引用计数，并维护「前缀缓存」：
-    用 block 内容的 hash 做 key，命中即可复用已算好的 KV，避免重复计算。
-
-简化说明（相比 vLLM）：
-  - FreeKVCacheBlockQueue 用 collections.deque 实现，remove 是 O(n)；
-    vLLM 用双向链表做到 O(1)，学习项目先不追求这个常数。
-  - BlockHash 直接用 token id 元组 tuple[int, ...]，省掉 block_hasher 机制。
-  - 省略 null_block（滑动窗口 / padding 用）、KV 事件、metrics 收集器。
-"""
-
-import logging
-from collections import deque
 from dataclasses import dataclass
+from typing import NewType
 
-logger = logging.getLogger(__name__)
+BlockHash = NewType("BlockHash", bytes)
+BlockHashWithGroupId = NewType("BlockHashWithGroupId", bytes)
 
-# block 内容 hash：直接复用 token id 元组（tuple 本身可哈希，作为前缀缓存 key）
-BlockHash = tuple[int, ...]
+
+def make_block_hash_with_group_id(
+    block_hash: BlockHash,
+    group_id: int,
+) -> BlockHashWithGroupId:
+    """把内容链式 hash 与 group id 合成 Prefix Cache 的完整键。"""
+
+    return BlockHashWithGroupId(
+        block_hash + group_id.to_bytes(4, byteorder="big", signed=False)
+    )
+
+
+def get_block_hash(key: BlockHashWithGroupId) -> BlockHash:
+    return BlockHash(key[:-4])
+
+
+def get_group_id(key: BlockHashWithGroupId) -> int:
+    return int.from_bytes(key[-4:], byteorder="big", signed=False)
 
 
 @dataclass(slots=True)
 class KVCacheBlock:
-    """KV cache 块元数据
+    """一个抽象 block 的 CPU 侧账本。
 
-    对应 vLLM 的 KVCacheBlock。
+    ``block_id`` 会原样作为 Worker KV tensor 第一维的下标；block 自身永远
+    不携带 head 数、head size 等形状信息，形状属于 KVCacheSpec。
     """
 
     block_id: int
-    ref_cnt: int = 0                       # 引用计数（多个请求共享同一前缀 block 时 +1）
-    _block_hash: BlockHash | None = None   # 内容 hash，命中前缀缓存时非空
-    is_null: bool = False                  # 占位块（本简化版未使用，保留字段）
+    ref_cnt: int = 0
+    _block_hash: BlockHashWithGroupId | None = None
+    _block_hash_num_tokens: int | None = None
+    prev_free_block: "KVCacheBlock | None" = None
+    next_free_block: "KVCacheBlock | None" = None
+    is_null: bool = False
 
     @property
-    def block_hash(self) -> BlockHash | None:
+    def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
 
-    def set_block_hash(self, block_hash: BlockHash) -> None:
-        """写入内容 hash（只在 block 首次写满时调用）"""
-        assert self._block_hash is None, "block 已存在 hash，不应重复设置"
+    @property
+    def block_hash_num_tokens(self) -> int | None:
+        return self._block_hash_num_tokens
+
+    def set_block_hash(
+        self,
+        block_hash: BlockHashWithGroupId,
+        num_tokens: int,
+    ) -> None:
+        if self._block_hash is not None:
+            raise RuntimeError(f"block {self.block_id} 已经注册过 hash")
         self._block_hash = block_hash
+        self._block_hash_num_tokens = num_tokens
 
     def reset_hash(self) -> None:
-        """block 被驱逐出前缀缓存时清空 hash"""
         self._block_hash = None
-
-    def __repr__(self) -> str:
-        return f"KVCacheBlock(block_id={self.block_id}, ref_cnt={self.ref_cnt})"
+        self._block_hash_num_tokens = None
 
 
 class FreeKVCacheBlockQueue:
-    """空闲 block 队列
+    """以双向链表维护空闲块和 ref_cnt=0 的 Prefix Cache 驱逐候选。
 
-    对应 vLLM 的 FreeKVCacheBlockQueue。约定「最久未使用（LRU）的 block 在队头」，
-    这样分配时 popleft 就能优先驱逐最久没用的 block。
-
-    简化：用 deque 实现。remove(block) 是 O(n)，vLLM 用双向链表做到 O(1)。
+    队头是最久未使用的 block。与 ``deque`` 版本相比，中间 block 被 Prefix
+    Cache 命中时可以 O(1) 摘除。
     """
 
     def __init__(self, blocks: list[KVCacheBlock]) -> None:
-        self._queue: deque[KVCacheBlock] = deque(blocks)
-        self.num_free_blocks = len(blocks)
+        self.num_free_blocks = 0
+        self.fake_free_list_head = KVCacheBlock(-1)
+        self.fake_free_list_tail = KVCacheBlock(-1)
+        self.fake_free_list_head.next_free_block = self.fake_free_list_tail
+        self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
+        for block in blocks:
+            self.append(block)
 
     def popleft(self) -> KVCacheBlock:
-        block = self._queue.popleft()
-        self.num_free_blocks -= 1
-        return block
+        first = self.fake_free_list_head.next_free_block
+        if first is None or first is self.fake_free_list_tail:
+            raise ValueError("没有可用的 KV cache block")
+        self.remove(first)
+        return first
 
     def popleft_n(self, n: int) -> list[KVCacheBlock]:
-        blocks = [self.popleft() for _ in range(n)]
-        return blocks
+        if n < 0 or n > self.num_free_blocks:
+            raise ValueError(f"无法从 {self.num_free_blocks} 个空闲块中取 {n} 个")
+        return [self.popleft() for _ in range(n)]
 
     def remove(self, block: KVCacheBlock) -> None:
-        """从队列中移除指定 block（O(n)）"""
-        self._queue.remove(block)
+        prev_block = block.prev_free_block
+        next_block = block.next_free_block
+        if prev_block is None or next_block is None:
+            raise RuntimeError(f"block {block.block_id} 不在空闲链表中")
+        prev_block.next_free_block = next_block
+        next_block.prev_free_block = prev_block
+        block.prev_free_block = None
+        block.next_free_block = None
         self.num_free_blocks -= 1
 
-    def prepend(self, block: KVCacheBlock) -> None:
-        """放到队头（成为 LRU 首选驱逐对象）"""
-        self._queue.appendleft(block)
+    def append(self, block: KVCacheBlock) -> None:
+        if block.prev_free_block is not None or block.next_free_block is not None:
+            raise RuntimeError(f"block {block.block_id} 已经在空闲链表中")
+        previous = self.fake_free_list_tail.prev_free_block
+        assert previous is not None
+        previous.next_free_block = block
+        block.prev_free_block = previous
+        block.next_free_block = self.fake_free_list_tail
+        self.fake_free_list_tail.prev_free_block = block
         self.num_free_blocks += 1
 
-
-class BlockPool:
-    """物理 block 池：分配 / 释放 / 引用计数 + 前缀缓存索引
-
-    对应 vLLM 的 BlockPool（简化版）。
-
-    Args:
-        num_gpu_blocks: block 总数（由显存估算得出）。
-        enable_caching: 是否启用前缀缓存。
-    """
-
-    def __init__(self, num_gpu_blocks: int, enable_caching: bool):
-        assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
-        self.num_gpu_blocks = num_gpu_blocks
-        self.enable_caching = enable_caching
-
-        # 所有 block 元数据，block_id 即下标
-        self.blocks: list[KVCacheBlock] = [
-            KVCacheBlock(block_id=i) for i in range(num_gpu_blocks)
-        ]
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
-
-        # 前缀缓存：block 内容 hash -> 已缓存 block（ref_cnt 可能为 0，属驱逐候选）
-        self.cached_block_hash_to_block: dict[BlockHash, KVCacheBlock] = {}
-
-    # ---- 前缀缓存 ----
-
-    def get_cached_block(self, block_hash: BlockHash) -> KVCacheBlock | None:
-        """按 hash 查前缀缓存，命中返回 block，否则 None"""
-        if not self.enable_caching:
-            return None
-        return self.cached_block_hash_to_block.get(block_hash)
-
-    def cache_block(self, block_hash: BlockHash, block: KVCacheBlock) -> None:
-        """把 block 注册进前缀缓存"""
-        if not self.enable_caching:
-            return
-        self.cached_block_hash_to_block[block_hash] = block
-
-    def _maybe_evict_cached_block(self, block: KVCacheBlock) -> None:
-        """block 被重新分配前，若它仍在前缀缓存里，则将其驱逐"""
-        if block.block_hash is None:
-            return
-        self.cached_block_hash_to_block.pop(block.block_hash, None)
-        block.reset_hash()
-
-    # ---- 分配 / 释放 ----
-
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
-        """从空闲队列取 num_blocks 个新 block（不检查前缀缓存，直接分配）
-
-        注意：被取出的 block 若之前是「驱逐候选」（ref_cnt==0 但仍带 hash），
-        需要先把它从前缀缓存驱逐掉，再交出去复用。
-        """
-        if num_blocks > self.free_block_queue.num_free_blocks:
-            raise ValueError(f"空闲 block 不足：需要 {num_blocks}，只剩 "
-                             f"{self.free_block_queue.num_free_blocks}")
-        blocks = self.free_block_queue.popleft_n(num_blocks)
-        for block in blocks:
-            self._maybe_evict_cached_block(block)
-            assert block.ref_cnt == 0
-            block.ref_cnt += 1
-        return blocks
-
-    def touch(self, blocks: list[KVCacheBlock]) -> None:
-        """前缀命中时给 block 引用计数 +1，若其原本在空闲队列则移出
-
-        对应 vLLM 的 BlockPool.touch()：ref_cnt==0 的 block 还挂在空闲队列里
-        （驱逐候选），被命中后要移出空闲队列（ref_cnt 变成 1，不再可被驱逐）。
-        """
-        for block in blocks:
-            if block.ref_cnt == 0 and not block.is_null:
-                self.free_block_queue.remove(block)
-            block.ref_cnt += 1
-
-    def free_blocks(self, blocks: list[KVCacheBlock]) -> None:
-        """释放一组 block，引用计数 -1；归零则放回空闲队列
-
-        参数按「分配顺序」传入（序列 head 在前、tail 在后）。实现上依次 prepend，
-        使序列尾部的 block 最终落在空闲队列最前（最先被驱逐）——这样能尽量保留
-        序列头部的 prompt 前缀 block，供后续请求做前缀缓存复用（对应 vLLM 的
-        「逆序释放，尾部先驱逐」语义）。
-
-        归零的 block 仍保留 hash（懒驱逐）：它成为驱逐候选，真正分配时才清 hash。
-        """
-        for block in blocks:
-            assert block.ref_cnt > 0, f"block {block.block_id} 引用计数异常"
-            block.ref_cnt -= 1
-            if block.ref_cnt == 0 and not block.is_null:
-                self.free_block_queue.prepend(block)
-
-    # ---- 查询 ----
-
-    def get_num_free_blocks(self) -> int:
-        return self.free_block_queue.num_free_blocks
-
-    def get_usage(self) -> float:
-        """KV cache 使用率（0.0 ~ 1.0）"""
-        return 1.0 - self.free_block_queue.num_free_blocks / self.num_gpu_blocks
+    def prepend(self, block: KVCacheBlock) -> None:
+        if block.prev_free_block is not None or block.next_free_block is not None:
+            raise RuntimeError(f"block {block.block_id} 已经在空闲链表中")
+        following = self.fake_free_list_head.next_free_block
+        assert following is not None
+        self.fake_free_list_head.next_free_block = block
+        block.prev_free_block = self.fake_free_list_head
+        block.next_free_block = following
+        following.prev_free_block = block
+        self.num_free_blocks += 1

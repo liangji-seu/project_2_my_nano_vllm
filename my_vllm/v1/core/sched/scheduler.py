@@ -49,7 +49,7 @@ class Scheduler:
         self.kv_cache_manager = kv_cache_manager
 
         self.max_model_len = vllm_config.max_model_len
-        self.block_size = vllm_config.block_size
+        self.block_size = kv_cache_manager.scheduler_block_size
         self.max_num_running_reqs = vllm_config.max_num_seqs
         self.max_num_scheduled_tokens = vllm_config.max_num_batched_tokens
 
@@ -119,7 +119,8 @@ class Scheduler:
         scheduled_running_reqs: list[Request] = []  # 本轮继续的req的名单
         preempted_reqs: list[Request] = []          # 本轮被抢占掉的名单（不运行，回到waiting了）
 
-        req_to_new_blocks: dict[str, list[int]] = {} # 本轮的req需要的新的block的页表
+        # 本轮新增的 block id，外层 tuple 的每一项对应一个 KV cache group。
+        req_to_new_blocks: dict[str, tuple[list[int], ...]] = {}
         num_scheduled_tokens: dict[str, int] = {}    # 本轮每个req所需要计算的token数（prompt长度的，chunked长度的，1token长度的）
         token_budget = self.max_num_scheduled_tokens # 本轮token预算
 
@@ -168,7 +169,7 @@ class Scheduler:
 
             scheduled_running_reqs.append(request)
             req_id = request.request_id
-            req_to_new_blocks[req_id] = new_blocks.get_block_ids()[0]
+            req_to_new_blocks[req_id] = new_blocks.get_block_ids()
             num_scheduled_tokens[req_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
@@ -233,8 +234,8 @@ class Scheduler:
 
                 scheduled_new_reqs.append(request)
                 # 新请求要发完整 block 表（含前缀命中的 block）
-                req_to_new_blocks[req_id] = (
-                    self.kv_cache_manager.get_block_ids(req_id)[0]
+                req_to_new_blocks[req_id] = self.kv_cache_manager.get_block_ids(
+                    req_id
                 )
                 num_scheduled_tokens[req_id] = num_new_tokens # 本轮的新req，需要完成prefix除了命中的剩余的tokens数
                 token_budget -= num_new_tokens
@@ -246,7 +247,7 @@ class Scheduler:
             NewRequestData(
                 req_id=r.request_id, # 每个请求的ID
                 prompt_token_ids=r.prompt_token_ids, # 每个req的 原始 prompt 的 token ids 序列 #
-                block_ids=(req_to_new_blocks[r.request_id],), # 每个req的新占用的block的列表
+                block_ids=req_to_new_blocks[r.request_id], # 每个group的完整block table
                 num_computed_tokens=r.num_computed_tokens, # 每个req的已经计算的tokens数量
                 max_tokens=r.max_tokens, # 这个req的最大总长度
             )
@@ -306,6 +307,14 @@ class Scheduler:
             idx = req_id_to_index[req_id]
             new_token_ids = sampled[idx] if sampled else []
             outputs[req_id] = new_token_ids
+
+            # schedule 阶段只是预留 block；执行器返回后 KV 才真实写好。
+            # 因此 Prefix Cache 必须在这里登记，并且只能登记已定稿的 full block。
+            num_tokens_to_cache = min(
+                request.num_computed_tokens,
+                request.num_tokens,
+            )
+            self.kv_cache_manager.cache_blocks(request, num_tokens_to_cache)
 
             stopped = self._update_request_with_output(request, new_token_ids)
             if stopped:
@@ -374,11 +383,11 @@ class Scheduler:
         self,
         scheduled_running_reqs: list[Request],
         num_scheduled_tokens: dict[str, int],
-        req_to_new_blocks: dict[str, list[int]],
+        req_to_new_blocks: dict[str, tuple[list[int], ...]],
     ) -> CachedRequestData:
         """构造老请求的增量数据"""
         req_ids = [r.request_id for r in scheduled_running_reqs] # 本轮继续的req的集合
-        new_block_ids = [tuple([req_to_new_blocks[r.request_id]]) for r in scheduled_running_reqs] # 本轮的继续req的新block数
+        new_block_ids = [req_to_new_blocks[r.request_id] for r in scheduled_running_reqs] # 各group本轮新增block
         num_computed = [r.num_computed_tokens for r in scheduled_running_reqs] # 本轮继续的req的已经计算过kvcache的token数
         num_scheduled = [num_scheduled_tokens[r.request_id] for r in scheduled_running_reqs] # 本轮继续req，在这一轮需要计算的token数
         return CachedRequestData(

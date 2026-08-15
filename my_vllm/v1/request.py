@@ -8,13 +8,16 @@
 
 简化说明（相比 vLLM）：
   - 去掉多模态 mm_features、结构化输出、LoRA、投机解码、pooling 等字段。
-  - 去掉 block_hashes：block 前缀 hash 改为由 KVCacheManager 按 token id 现算。
   - 去掉 torch 依赖（不保留 prompt_embeds），纯 Python 可运行、可测试。
 """
 
 import enum
+import hashlib
+import struct
 import time
 from dataclasses import dataclass
+
+from my_vllm.v1.core.kv_cache_utils import BlockHash
 
 
 @dataclass
@@ -107,6 +110,11 @@ class Request:
         self._output_token_ids: list[int] = []
         self._all_token_ids: list[int] = self.prompt_token_ids.copy()
 
+        # Request 维护「内容 -> 链式 hash」，KVCacheManager 维护
+        # 「链式 hash + group id -> block」。Request 不保存任何物理 block id。
+        self.block_hashes: list[BlockHash] = []
+        self._block_hash_size: int | None = None
+
     # ---- 只读视图（禁止外部直接 append，必须走 append_output_token_ids）----
 
     @property
@@ -134,6 +142,32 @@ class Request:
             token_ids = [token_ids]
         self._output_token_ids.extend(token_ids)
         self._all_token_ids.extend(token_ids)
+        if self._block_hash_size is not None:
+            self.update_block_hashes(self._block_hash_size)
+
+    def update_block_hashes(self, block_size: int) -> None:
+        """为所有新增 full block 计算确定性的链式内容 hash。
+
+        第 N 块的 hash 同时包含第 N-1 块 hash 和本块 token，因此相同的局部
+        token 片段只有在前面的完整 prefix 也相同时才会命中。
+        """
+
+        if block_size <= 0:
+            raise ValueError("block_size 必须大于 0")
+        if self._block_hash_size not in (None, block_size):
+            raise ValueError("同一个 Request 不能切换 block hash 粒度")
+        self._block_hash_size = block_size
+
+        num_full_blocks = self.num_tokens // block_size
+        previous_hash = (
+            bytes(self.block_hashes[-1]) if self.block_hashes else bytes(32)
+        )
+        for block_index in range(len(self.block_hashes), num_full_blocks):
+            start = block_index * block_size
+            token_ids = self._all_token_ids[start : start + block_size]
+            token_bytes = b"".join(struct.pack(">q", token) for token in token_ids)
+            previous_hash = hashlib.sha256(previous_hash + token_bytes).digest()
+            self.block_hashes.append(BlockHash(previous_hash))
 
     # ---- 结束判定 ----
 

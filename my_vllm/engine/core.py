@@ -33,7 +33,7 @@ class EngineCore:
       - self.scheduler:        调度器（请求队列 + KV cache 分配 + 输出推进）
       - self.kv_cache_manager: KV cache 管理器（block 池 + 前缀缓存 + 引用计数）
       - self.model_executor:   模型执行器（管理 GPU worker，执行 forward）
-      - self.kv_cache_config:  KV cache 配置（简化：直接复用 EngineConfig）
+      - self.kv_cache_config:  Worker 显存布局 + KV cache group 形状配置
     """
 
     def __init__(self, vllm_config: EngineConfig):
@@ -42,11 +42,16 @@ class EngineCore:
 
         # KV cache 管理器：物理 block 池 + 前缀缓存 + 引用计数（CPU 侧账本）
         from my_vllm.v1.core.kv_cache_manager import KVCacheManager
+        from my_vllm.v1.kv_cache_interface import make_default_kv_cache_config
 
-        self.kv_cache_config = vllm_config  # 简化：直接用 EngineConfig 充当 CacheConfig
-        self.kv_cache_manager = KVCacheManager(
-            num_gpu_blocks=vllm_config.num_gpu_blocks,
+        # 当前 Worker profiling 尚未实现，先用 CLI 的 block 数构造单 group 配置。
+        # 后续 profiling 接入后只需替换这份 KVCacheConfig 的来源，下层架构不变。
+        self.kv_cache_config = make_default_kv_cache_config(
+            num_blocks=vllm_config.num_gpu_blocks,
             block_size=vllm_config.block_size,
+        )
+        self.kv_cache_manager = KVCacheManager(
+            kv_cache_config=self.kv_cache_config,
             max_model_len=vllm_config.max_model_len,
             enable_caching=vllm_config.enable_prefix_caching,
         )
