@@ -63,9 +63,17 @@ class EngineConfig:
     enable_log_requests: bool = False
     seed: int = 0  # 随机种子，保证推理链的确定性
 
+    # ---- 模型加载配置（简化版 ModelConfig + LoadConfig）----
+    load_format: str = "safetensors"
+    dtype: str = "auto"
+
     # ---- KV cache 配置（简化版 CacheConfig）----
     block_size: int = 16        # 每个 KV block 容纳的 token 数
-    num_gpu_blocks: int = 1024  # KV block 总数（TODO: 后续按「可用显存 × 利用率」自动计算）
+    # None 表示由 profiling 自动计算；显式指定仅用于调试/复现实验。
+    num_gpu_blocks: int | None = None
+    gpu_memory_utilization: float = 0.9
+    kv_cache_memory_bytes: int | None = None
+    kv_cache_dtype: str = "auto"
     enable_prefix_caching: bool = True  # 是否启用前缀缓存（prefix caching）
 
     # ---- 调度器配置（简化版 SchedulerConfig）----
@@ -87,8 +95,13 @@ class EngineConfig:
             data_parallel_size=getattr(args, "dp_size", 1),
             enable_log_requests=getattr(args, "enable_log_requests", False),
             seed=getattr(args, "seed", 0),
+            load_format=getattr(args, "load_format", "safetensors"),
+            dtype=getattr(args, "dtype", "auto"),
             block_size=getattr(args, "block_size", 16),
-            num_gpu_blocks=getattr(args, "num_gpu_blocks", 1024),
+            num_gpu_blocks=getattr(args, "num_gpu_blocks", None),
+            gpu_memory_utilization=getattr(args, "gpu_memory_utilization", 0.9),
+            kv_cache_memory_bytes=getattr(args, "kv_cache_memory_bytes", None),
+            kv_cache_dtype=getattr(args, "kv_cache_dtype", "auto"),
             enable_prefix_caching=not getattr(args, "disable_prefix_caching", False),
             max_num_seqs=getattr(args, "max_num_seqs", 32),
             max_num_batched_tokens=getattr(args, "max_num_batched_tokens", 2048),
@@ -112,6 +125,18 @@ def make_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model", type=str, default="test-model", help="模型名称或路径"
+    )
+    parser.add_argument(
+        "--load-format",
+        choices=("safetensors", "dummy"),
+        default="safetensors",
+        help="权重加载格式；dummy 只构造并随机初始化模型，用于结构调试",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=("auto", "float16", "bfloat16", "float32"),
+        default="auto",
+        help="模型参数 dtype",
     )
     parser.add_argument(
         "--disable-log-stats",
@@ -168,8 +193,26 @@ def make_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--num-gpu-blocks",
         type=int,
-        default=1024,
-        help="KV cache block 总数（占位值，后续按显存自动计算）",
+        default=None,
+        help="手工覆盖 KV cache block 数；默认由 profiling 自动计算",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="单个 Worker 可使用的 GPU 总显存比例",
+    )
+    parser.add_argument(
+        "--kv-cache-memory-bytes",
+        type=int,
+        default=None,
+        help="手工指定 KV cache 字节预算；指定后仍跑 dummy forward，但跳过自动预算",
+    )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        choices=("auto", "float16", "bfloat16", "float32"),
+        default="auto",
+        help="KV cache dtype；auto 跟随模型 dtype",
     )
     parser.add_argument(
         "--disable-prefix-caching",

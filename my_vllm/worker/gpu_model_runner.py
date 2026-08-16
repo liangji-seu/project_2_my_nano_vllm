@@ -1,93 +1,197 @@
-"""
-GPUModelRunner 骨架 — Worker 内部的模型执行器
+"""Worker 内的模型构造、权重加载、profiling 与 KV Cache 物理初始化。"""
 
-对应 vLLM 的 vllm/v1/worker/gpu_model_runner.py
-
-当前阶段：只搭骨架，让 Worker 初始化链路能跑通，不实现真实推理。
-
-后续 commit 实现（这是 vLLM 里最核心、最复杂的一个类）：
-  - 模型加载：按模型名/路径构造模型结构，按 TP/PP 切分权重并放置到对应 GPU
-  - 输入批处理：构造 InputBatch（把 scheduler 输出的 token 喂给模型）
-  - forward 执行：模型前向 + 采样（sample）
-"""
+from __future__ import annotations
 
 import logging
 
 import torch
 import torch.nn as nn
 
+from my_vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+
 logger = logging.getLogger(__name__)
 
 
 class GPUModelRunner:
-    """模型执行器（骨架）
+    """持有一个 Worker rank 的模型和真实 KV Cache 张量。
 
-    职责（预留）：
-      - 持有模型实例 self.model
-      - 加载权重并放到 GPU
-      - 把 scheduler 输出的输入 batch 喂给模型，执行 forward
+    本阶段刻意不接 ``SchedulerOutput -> InputBatch``：真实模型只用于 profiling，
+    在线 execute_model 仍保留确定性 mock 采样。
     """
 
     def __init__(self, vllm_config, device: torch.device):
         self.vllm_config = vllm_config
-        self.model_config = vllm_config  # 简化：直接用 EngineConfig 充当 model_config
         self.device = device
-
-        # 模型实例，load_model() 后填充
         self.model: nn.Module | None = None
-
-        # 每个请求已生成的输出 token 数（mock 采样用，模拟 worker 侧逐请求的生成状态）
+        self.hf_config: dict = {}
+        self.model_dtype = torch.float16
+        self.model_memory_usage = 0
+        self.kv_caches: dict[str, torch.Tensor] = {}
+        self.kv_cache_config: KVCacheConfig | None = None
         self._req_output_counts: dict[str, int] = {}
 
-        logger.info("GPUModelRunner 骨架已构造 (device=%s)", device)
+    @property
+    def is_mock_model(self) -> bool:
+        return self.vllm_config.model == "test-model"
 
     def load_model(self) -> None:
-        """加载模型权重（TODO：暂未实现）
+        if self.is_mock_model:
+            logger.info("test-model 使用 mock 执行路径，跳过真实模型权重加载")
+            return
+        if self.vllm_config.parallel_config.world_size != 1:
+            raise NotImplementedError(
+                "真实 Qwen2 权重目前只支持 TP=1、PP=1；TP/PP 权重切分属于后续分布式阶段"
+            )
 
-        对应 vLLM 的 model_loader.load_model()：
-          - 根据模型名/路径构造模型结构
-          - 按 TP/PP 切分权重并放置到 self.device
-          - model.eval()
-        """
-        # TODO: 真实加载模型权重。骨架阶段先置空，让初始化链路能跑通。
-        self.model = None
-        logger.warning(
-            "GPUModelRunner.load_model() 未实现（骨架），self.model=None"
+        from my_vllm.model_executor.model_loader import load_model
+
+        before = (
+            torch.cuda.memory_allocated(self.device)
+            if self.device.type == "cuda"
+            else 0
+        )
+        model, hf_config, dtype, loaded = load_model(
+            self.vllm_config.model,
+            self.device,
+            self.vllm_config.dtype,
+            self.vllm_config.load_format,
+        )
+        self.model = model
+        self.hf_config = hf_config
+        self.model_dtype = dtype
+        if self.device.type == "cuda":
+            self.model_memory_usage = torch.cuda.memory_allocated(self.device) - before
+        else:
+            self.model_memory_usage = sum(
+                p.numel() * p.element_size() for p in model.parameters()
+            )
+        logger.info(
+            "模型加载完成：architecture=%s, parameters=%d, loaded_tensors=%d, memory=%.2f GiB",
+            hf_config.get("architectures", ["unknown"])[0],
+            sum(p.numel() for p in model.parameters()),
+            len(loaded),
+            self.model_memory_usage / 1024**3,
+        )
+
+    def get_kv_cache_spec(self) -> dict[str, FullAttentionSpec]:
+        if self.is_mock_model:
+            return {
+                "mock.layers.0.self_attn": FullAttentionSpec(
+                    block_size=self.vllm_config.block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype="float16",
+                )
+            }
+        assert self.model is not None
+        dtype_name = str(self.model_dtype).removeprefix("torch.")
+        if self.vllm_config.kv_cache_dtype != "auto":
+            dtype_name = self.vllm_config.kv_cache_dtype
+        return {
+            name: FullAttentionSpec(
+                block_size=self.vllm_config.block_size,
+                num_kv_heads=attention.num_kv_heads,
+                head_size=attention.head_dim,
+                dtype=dtype_name,
+            )
+            for name, attention in self.model.attention_layers()
+        }
+
+    @torch.inference_mode()
+    def profile_run(self) -> None:
+        """用最大 token 预算跑一次无 KV Cache 的 dummy forward。"""
+
+        if self.is_mock_model:
+            if self.device.type == "cuda":
+                # mock 模式也真正触发一次很小的 CUDA allocation，验证 profiling 链路。
+                torch.empty(1, device=self.device)
+                torch.cuda.synchronize(self.device)
+            return
+        assert self.model is not None
+        num_tokens = min(
+            self.vllm_config.max_num_batched_tokens,
+            self.vllm_config.max_model_len,
+            int(
+                self.hf_config.get(
+                    "max_position_embeddings", self.vllm_config.max_model_len
+                )
+            ),
+        )
+        vocab_size = int(self.hf_config["vocab_size"])
+        input_ids = torch.randint(0, vocab_size, (1, num_tokens), device=self.device)
+        hidden_states = self.model(input_ids)
+        # vLLM 只对需要采样的位置算 logits。这里取最多 max_num_seqs 个末尾
+        # hidden state，覆盖 logits/sampler 峰值但不引入 InputBatch 状态。
+        num_sampled_positions = min(self.vllm_config.max_num_seqs, num_tokens)
+        logits = self.model.compute_logits(hidden_states[:, -num_sampled_positions:, :])
+        _ = torch.argmax(logits, dim=-1)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        del input_ids, hidden_states, logits
+
+    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        """按 KVCacheTensor 分配 byte buffer，再 reshape 出 block 第一维。"""
+
+        specs_by_layer = {
+            layer_name: group.kv_cache_spec
+            for group in kv_cache_config.kv_cache_groups
+            for layer_name in group.layer_names
+        }
+        raw_by_layer: dict[str, torch.Tensor] = {}
+        self.kv_caches = {}
+        for tensor_config in kv_cache_config.kv_cache_tensors:
+            raw = torch.zeros(tensor_config.size, dtype=torch.uint8, device=self.device)
+            for layer_name in tensor_config.shared_by:
+                raw_by_layer[layer_name] = raw
+
+        dtype_map = {
+            "float16": torch.float16,
+            "torch.float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "torch.bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+            "torch.float32": torch.float32,
+        }
+        for layer_name, spec in specs_by_layer.items():
+            if not isinstance(spec, FullAttentionSpec):
+                raise NotImplementedError(type(spec).__name__)
+            raw = raw_by_layer[layer_name]
+            cache = raw.view(dtype_map[spec.dtype]).view(
+                kv_cache_config.num_blocks,
+                2,
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+            )
+            self.kv_caches[layer_name] = cache
+
+        if self.model is not None:
+            attention_layers = dict(self.model.attention_layers())
+            for layer_name, cache in self.kv_caches.items():
+                attention_layers[layer_name].kv_cache = cache
+        self.kv_cache_config = kv_cache_config
+        logger.info(
+            "KV Cache 物理初始化完成：layers=%d, blocks=%d, bytes=%.2f GiB",
+            len(self.kv_caches),
+            kv_cache_config.num_blocks,
+            sum(t.size for t in kv_cache_config.kv_cache_tensors) / 1024**3,
         )
 
     def get_model(self) -> nn.Module | None:
-        """返回模型实例"""
         return self.model
 
     def execute_model(self, scheduler_output):
-        """执行一次前向 + 采样（当前为 mock 占位，供 collective_rpc 链路跑通）
-
-        对应 vLLM 的 GPUModelRunner.execute_model()。真实实现是把 scheduler_output
-        的输入喂给模型 forward + 采样；本方法运行在 worker 进程内，由 EngineCore
-        通过 executor.collective_rpc 广播调用。
-
-        骨架阶段不跑真实模型，用确定性 mock 采样占位：每个请求每步生成一个可打印
-        字符（按该请求已生成输出数轮转 a..z），保证主循环能跑通、请求能正常结束。
-        用 self._req_output_counts 维护 worker 侧逐请求的「已生成输出数」，模拟
-        真实 worker 为每个请求保存的生成状态。
-        """
+        """InputBatch 尚未实现，继续使用可验证控制面的确定性 mock 采样。"""
         from my_vllm.v1.core.sched.output import ModelRunnerOutput
 
-        # 本轮被调度的请求 id（新/老请求统一从 num_scheduled_tokens 取）
         req_ids = list(scheduler_output.num_scheduled_tokens.keys())
-
-        sampled_token_ids: list[list[int]] = []
+        sampled_token_ids = []
         for req_id in req_ids:
-            # 确定性「采样」：按已生成输出数轮转 a..z，避免 control 字符污染输出
             count = self._req_output_counts.get(req_id, 0)
-            token_id = ord("a") + (count % 26)
-            sampled_token_ids.append([token_id])
+            sampled_token_ids.append([ord("a") + count % 26])
             self._req_output_counts[req_id] = count + 1
-
-        # 释放已结束请求的本地计数（对应 worker 释放缓存状态的语义）
         for req_id in scheduler_output.finished_req_ids:
             self._req_output_counts.pop(req_id, None)
-
         return ModelRunnerOutput(
             req_ids=req_ids,
             sampled_token_ids=sampled_token_ids,

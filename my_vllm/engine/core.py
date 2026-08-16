@@ -40,27 +40,6 @@ class EngineCore:
         self.vllm_config = vllm_config
         self._is_running = True
 
-        # KV cache 管理器：物理 block 池 + 前缀缓存 + 引用计数（CPU 侧账本）
-        from my_vllm.v1.core.kv_cache_manager import KVCacheManager
-        from my_vllm.v1.kv_cache_interface import make_default_kv_cache_config
-
-        # 当前 Worker profiling 尚未实现，先用 CLI 的 block 数构造单 group 配置。
-        # 后续 profiling 接入后只需替换这份 KVCacheConfig 的来源，下层架构不变。
-        self.kv_cache_config = make_default_kv_cache_config(
-            num_blocks=vllm_config.num_gpu_blocks,
-            block_size=vllm_config.block_size,
-        )
-        self.kv_cache_manager = KVCacheManager(
-            kv_cache_config=self.kv_cache_config,
-            max_model_len=vllm_config.max_model_len,
-            enable_caching=vllm_config.enable_prefix_caching,
-        )
-
-        # 调度器：每步选出哪些请求、分配多少 token 和 KV block
-        from my_vllm.v1.core.sched.scheduler import Scheduler
-
-        self.scheduler = Scheduler(vllm_config, self.kv_cache_manager)
-
         # 创建执行器：拉起所有 worker 进程。
         # worker 的【阶段 1/3】init_device 与【阶段 2/3】load_model 在
         # worker 进程内直接执行，此调用返回时 worker 已就绪。
@@ -68,8 +47,21 @@ class EngineCore:
 
         self.model_executor = MultiprocExecutor(vllm_config)
 
-        # 【Worker 初始化 · 阶段 3/3】通过 collective_rpc 让所有 worker 初始化 KV cache
-        self._initialize_kv_caches()
+        # Worker 先根据真实模型给出 spec 并 profiling；EngineCore 据此生成唯一的
+        # KVCacheConfig，再同时交给 GPU 物理张量和 CPU BlockPool 使用。
+        self.kv_cache_config = self._initialize_kv_caches()
+
+        from my_vllm.v1.core.kv_cache_manager import KVCacheManager
+
+        self.kv_cache_manager = KVCacheManager(
+            kv_cache_config=self.kv_cache_config,
+            max_model_len=vllm_config.max_model_len,
+            enable_caching=vllm_config.enable_prefix_caching,
+        )
+
+        from my_vllm.v1.core.sched.scheduler import Scheduler
+
+        self.scheduler = Scheduler(vllm_config, self.kv_cache_manager)
 
         logger.info(
             "EngineCore 初始化完成 (model=%s, max_model_len=%d)",
@@ -77,7 +69,7 @@ class EngineCore:
             vllm_config.max_model_len,
         )
 
-    def _initialize_kv_caches(self) -> None:
+    def _initialize_kv_caches(self):
         """【Worker 初始化 · 阶段 3/3】Initialize KV Cache
 
         对应 vLLM EngineCore._initialize_kv_caches()。
@@ -86,10 +78,27 @@ class EngineCore:
         阶段 3 由 EngineCore 通过 collective_rpc 统一触发，让每个 worker 分配
         KV cache 显存。
         """
-        # 简化：block 数直接取配置值；真实实现要根据「可用显存 × 利用率」计算
-        num_gpu_blocks = self.vllm_config.num_gpu_blocks
-        results = self.model_executor.initialize_cache(num_gpu_blocks)
-        logger.info("KV cache 初始化完成，各 worker ack：%s", results)
+        from my_vllm.v1.kv_cache_interface import generate_kv_cache_config
+
+        worker_specs = self.model_executor.get_kv_cache_specs()
+        reference_spec = worker_specs[0]
+        if any(spec != reference_spec for spec in worker_specs[1:]):
+            raise RuntimeError("不同 Worker 返回的 KV cache spec 不一致")
+        available_per_worker = self.model_executor.determine_available_memory()
+        available_memory = min(available_per_worker)
+        kv_cache_config = generate_kv_cache_config(
+            reference_spec,
+            available_memory,
+            num_blocks_override=self.vllm_config.num_gpu_blocks,
+        )
+        results = self.model_executor.initialize_from_config(kv_cache_config)
+        logger.info(
+            "KV cache 初始化完成：available_per_worker=%s, common_blocks=%d, ack=%s",
+            available_per_worker,
+            kv_cache_config.num_blocks,
+            results,
+        )
+        return kv_cache_config
 
     def is_running(self) -> bool:
         return self._is_running

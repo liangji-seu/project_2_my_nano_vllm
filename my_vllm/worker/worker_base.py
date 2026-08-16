@@ -60,7 +60,7 @@ class WorkerBase:
         """执行一次模型前向（推理主路径）"""
         raise NotImplementedError
 
-    def initialize_cache(self, num_gpu_blocks: int):
+    def initialize_from_config(self, kv_cache_config):
         """【阶段 3/3】初始化 KV cache（由 EngineCore 通过 collective_rpc 触发）"""
         raise NotImplementedError
 
@@ -88,7 +88,7 @@ class WorkerWrapperBase:
       是哪种 Worker。
 
     关键点：wrapper 自己定义的方法（init_worker / init_device / shutdown）优先级
-    高于 __getattr__ 转发；其余方法（load_model / execute_model / initialize_cache
+    高于 __getattr__ 转发；其余方法（load_model / execute_model / initialize_from_config
     等）直接透传给 self.worker。
     """
 

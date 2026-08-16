@@ -7,7 +7,7 @@ Worker 的三阶段初始化（每个 GPU 进程一份）：
   【阶段 1/3】init_device      — 在 worker 进程内直接执行：
                                  绑定 GPU + 拉起 NCCL + 构造 model_runner
   【阶段 2/3】load_model       — 在 worker 进程内直接执行：构造模型结构 + 加载权重
-  【阶段 3/3】initialize_cache — 由 EngineCore 通过 collective_rpc 触发：
+【阶段 3/3】initialize_from_config — 由 EngineCore 通过 collective_rpc 触发：
                                  分配 KV cache 显存
 
 阶段 1/2 在 WorkerProc.__init__ 里被直接调用；阶段 3 是 EngineCore 主动 RPC。
@@ -93,7 +93,16 @@ class Worker(WorkerBase):
         gc.collect()
         torch.cuda.empty_cache()
 
-        # 5. 构造 model_runner（骨架，内含 InputBatch 等，后续实现）
+        # 在模型加载前拍照。后续 profiling 会把「外部/NCCL 已占用 + 模型权重
+        # + dummy forward 峰值」都从总预算中扣除。
+        if self.device.type == "cuda":
+            free_memory, total_memory = torch.cuda.mem_get_info(self.device)
+        else:
+            free_memory = total_memory = 0
+        self.init_free_memory = free_memory
+        self.total_memory = total_memory
+
+        # 5. 构造 model_runner（本阶段已实现加载/profiling/KV，InputBatch 后续接入）
         from my_vllm.worker.gpu_model_runner import GPUModelRunner
 
         self.model_runner = GPUModelRunner(self.vllm_config, self.device)
@@ -137,17 +146,72 @@ class Worker(WorkerBase):
         self.model_runner.load_model()
         logger.info("Worker rank=%d 完成【阶段 2/3】Load Model", self.rank)
 
-    def initialize_cache(self, num_gpu_blocks: int):
+    def get_kv_cache_spec(self):
+        """返回本 rank 模型逐层的 KV page 规格。"""
+        return self.model_runner.get_kv_cache_spec()
+
+    @torch.inference_mode()
+    def determine_available_memory(self) -> int:
+        """profiling dummy forward，返回可分给 KV Cache 的字节数。"""
+        if self.model_runner.is_mock_model:
+            specs = self.model_runner.get_kv_cache_spec()
+            blocks = self.vllm_config.num_gpu_blocks or 1024
+            return blocks * sum(spec.page_size_bytes for spec in specs.values())
+        if self.device.type != "cuda":
+            raise RuntimeError("真实模型 profiling 需要 CUDA GPU")
+
+        utilization = self.vllm_config.gpu_memory_utilization
+        if not 0 < utilization <= 1:
+            raise ValueError("gpu_memory_utilization 必须在 (0, 1] 范围内")
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        free_after_load, _ = torch.cuda.mem_get_info(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
+        allocated_before_profile = torch.cuda.memory_allocated(self.device)
+        self.model_runner.profile_run()
+        peak_allocated = torch.cuda.max_memory_allocated(self.device)
+        activation_peak = max(0, peak_allocated - allocated_before_profile)
+
+        requested_memory = int(self.total_memory * utilization)
+        memory_used_before_profile = self.total_memory - free_after_load
+        non_kv_cache_memory = memory_used_before_profile + activation_peak
+        available = requested_memory - non_kv_cache_memory
+        manual = self.vllm_config.kv_cache_memory_bytes
+        if manual is not None:
+            available = manual
+        if available <= 0:
+            raise MemoryError(
+                "profiling 后没有可用 KV cache 显存："
+                f"total={self.total_memory}, utilization={utilization}, "
+                f"used_before_profile={memory_used_before_profile}, "
+                f"activation_peak={activation_peak}, available={available}"
+            )
+        logger.info(
+            "显存 profiling：total=%.2f GiB, requested=%.2f GiB, "
+            "weights=%.2f GiB, activation_peak=%.2f GiB, available_kv=%.2f GiB",
+            self.total_memory / 1024**3,
+            requested_memory / 1024**3,
+            self.model_runner.model_memory_usage / 1024**3,
+            activation_peak / 1024**3,
+            available / 1024**3,
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
+        return available
+
+    def initialize_from_config(self, kv_cache_config):
         """【Worker 初始化 · 阶段 3/3】Initialize KV Cache
 
         由 EngineCore 通过 collective_rpc 触发，为每个 worker 分配 KV cache 显存。
-        骨架阶段只记录 block 数，不真实分配。
+        按 EngineCore 计算出的物理布局真实分配、reshape 并绑定到 attention layer。
         """
-        self.num_gpu_blocks = num_gpu_blocks
+        self.num_gpu_blocks = kv_cache_config.num_blocks
+        self.model_runner.initialize_kv_cache(kv_cache_config)
         logger.info(
             "Worker rank=%d 完成【阶段 3/3】Initialize KV Cache (blocks=%d)",
             self.rank,
-            num_gpu_blocks,
+            kv_cache_config.num_blocks,
         )
         # 回传 ack，供 EngineCore 确认本 worker 已完成
         return self.rank

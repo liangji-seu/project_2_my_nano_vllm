@@ -471,9 +471,17 @@ class MultiprocExecutor:
             "execute_model", args=(scheduler_output,), unique_reply_rank=output_rank
         )
 
-    def initialize_cache(self, num_gpu_blocks: int) -> list:
-        """初始化 KV cache（阶段 3），所有 worker 都回传 ack"""
-        return self.collective_rpc("initialize_cache", args=(num_gpu_blocks,))
+    def get_kv_cache_specs(self) -> list:
+        """收集每个 Worker 根据本 rank 模型得到的逐层 KV 规格。"""
+        return self.collective_rpc("get_kv_cache_spec")
+
+    def determine_available_memory(self) -> list[int]:
+        """让所有 Worker 做 profiling，返回各 rank 的 KV 可用字节数。"""
+        return self.collective_rpc("determine_available_memory")
+
+    def initialize_from_config(self, kv_cache_config) -> list:
+        """按完整 KVCacheConfig 初始化物理 KV cache，所有 Worker 回传 ack。"""
+        return self.collective_rpc("initialize_from_config", args=(kv_cache_config,))
 
     def check_health(self) -> list:
         """健康检查（用于验证 RPC 通路）"""
