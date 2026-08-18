@@ -7,7 +7,7 @@ Scheduler 每步产出 SchedulerOutput，交给执行器；执行器前向 + 采
 ModelRunnerOutput，再由 Scheduler.update_from_output() 消费。
 
 简化说明（相比 vLLM）：
-  - NewRequestData 去掉 sampling_params / lora / mm_features 等，只留调度必需字段。
+  - NewRequestData 保留 sampling_params 和完整 token 快照；去掉 LoRA / 多模态等字段。
   - CachedRequestData 去掉投机解码、PP 的 new_token_ids 等。
   - SchedulerOutput 去掉 encoder / spec decode / KV connector 等字段。
   - ModelRunnerOutput 从 vllm/v1/outputs.py 挪到这里，只保留采样 token。
@@ -15,15 +15,18 @@ ModelRunnerOutput，再由 Scheduler.update_from_output() 消费。
 
 from dataclasses import dataclass, field
 
-from my_vllm.v1.request import FinishReason
+from my_vllm.v1.request import FinishReason, SamplingParams
 
 
 @dataclass
 class NewRequestData:
-    """本轮首次被调度的请求（要完整发给 worker 的元数据）"""
+    """首次调度或抢占恢复的请求（向 Worker 发送完整快照）。"""
 
     req_id: str
     prompt_token_ids: list[int]
+    # 抢占恢复时不能只重发 prompt；Worker 重建持久状态还需要此前已生成的 token。
+    output_token_ids: list[int]
+    sampling_params: SamplingParams
     block_ids: tuple[list[int], ...]  # 完整 block 表（含前缀命中的 block）
     num_computed_tokens: int          # 已计算 token 数（前缀命中数）
     max_tokens: int

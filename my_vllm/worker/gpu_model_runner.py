@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from my_vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+from my_vllm.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 logger = logging.getLogger(__name__)
 
@@ -15,8 +16,8 @@ logger = logging.getLogger(__name__)
 class GPUModelRunner:
     """持有一个 Worker rank 的模型和真实 KV Cache 张量。
 
-    本阶段刻意不接 ``SchedulerOutput -> InputBatch``：真实模型只用于 profiling，
-    在线 execute_model 仍保留确定性 mock 采样。
+    当前已接通 ``SchedulerOutput -> CachedRequestState -> InputBatch`` 的持久状态
+    同步；真实 ``model()`` 前向与采样仍留给下一阶段。
     """
 
     def __init__(self, vllm_config, device: torch.device):
@@ -28,7 +29,9 @@ class GPUModelRunner:
         self.model_memory_usage = 0
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.kv_cache_config: KVCacheConfig | None = None
-        self._req_output_counts: dict[str, int] = {}
+        self.requests: dict[str, CachedRequestState] = {}
+        # KV cache group 数要到 initialize_kv_cache 才能确定，因此延迟构造。
+        self.input_batch: InputBatch | None = None
 
     @property
     def is_mock_model(self) -> bool:
@@ -170,6 +173,11 @@ class GPUModelRunner:
             for layer_name, cache in self.kv_caches.items():
                 attention_layers[layer_name].kv_cache = cache
         self.kv_cache_config = kv_cache_config
+        self.input_batch = InputBatch(
+            max_num_reqs=self.vllm_config.max_num_seqs,
+            max_model_len=self.vllm_config.max_model_len,
+            num_kv_cache_groups=len(kv_cache_config.kv_cache_groups),
+        )
         logger.info(
             "KV Cache 物理初始化完成：layers=%d, blocks=%d, bytes=%.2f GiB",
             len(self.kv_caches),
@@ -180,18 +188,136 @@ class GPUModelRunner:
     def get_model(self) -> nn.Module | None:
         return self.model
 
+    def _update_states(self, scheduler_output) -> None:
+        """用 SchedulerOutput 增量更新请求缓存和持久 InputBatch。"""
+
+        if self.input_batch is None:
+            raise RuntimeError("必须先 initialize_kv_cache，再执行模型")
+
+        # 1. 已结束请求：完整状态与 batch 槽位一起释放。
+        for req_id in scheduler_output.finished_req_ids:
+            self.requests.pop(req_id, None)
+            self.input_batch.remove_request(req_id)
+
+        # 2. 本轮未调度请求：只移出紧凑 batch，完整请求状态继续缓存。
+        scheduled_req_ids = set(scheduler_output.num_scheduled_tokens)
+        unscheduled_req_ids = (
+            set(self.input_batch.req_id_to_index) - scheduled_req_ids
+        )
+        for req_id in unscheduled_req_ids:
+            self.input_batch.remove_request(req_id)
+        self.input_batch.condense()
+
+        # 3. 新请求或抢占恢复请求携带完整快照，覆盖 Worker 的旧缓存。
+        for new_req in scheduler_output.scheduled_new_reqs:
+            req_state = CachedRequestState(
+                req_id=new_req.req_id,
+                prompt_token_ids=list(new_req.prompt_token_ids),
+                output_token_ids=list(new_req.output_token_ids),
+                sampling_params=new_req.sampling_params,
+                block_ids=tuple(list(ids) for ids in new_req.block_ids),
+                num_computed_tokens=new_req.num_computed_tokens,
+            )
+            self.requests[new_req.req_id] = req_state
+            if new_req.req_id in self.input_batch.req_id_to_index:
+                self.input_batch.remove_request(new_req.req_id)
+                self.input_batch.condense()
+            self.input_batch.add_request(req_state)
+
+        # 4. 已缓存请求只接收 computed 进度和本轮新增 block id。
+        cached = scheduler_output.scheduled_cached_reqs
+        field_lengths = {
+            len(cached.req_ids),
+            len(cached.new_block_ids),
+            len(cached.num_computed_tokens),
+            len(cached.num_scheduled_tokens),
+        }
+        if len(field_lengths) != 1:
+            raise ValueError("CachedRequestData 各字段长度不一致")
+
+        for index, req_id in enumerate(cached.req_ids):
+            try:
+                req_state = self.requests[req_id]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"Worker 没有请求 {req_id} 的缓存状态，无法应用增量"
+                ) from exc
+
+            req_state.num_computed_tokens = cached.num_computed_tokens[index]
+            new_block_ids = cached.new_block_ids[index]
+            if new_block_ids is not None:
+                for block_ids, new_ids in zip(
+                    req_state.block_ids, new_block_ids, strict=True
+                ):
+                    block_ids.extend(new_ids)
+
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if req_index is None:
+                self.input_batch.add_request(req_state)
+            else:
+                self.input_batch.num_computed_tokens_cpu[req_index] = (
+                    req_state.num_computed_tokens
+                )
+                if new_block_ids is not None:
+                    self.input_batch.block_table.append_row(
+                        new_block_ids, req_index
+                    )
+
+        if set(self.input_batch.req_ids) != scheduled_req_ids:
+            raise RuntimeError(
+                "InputBatch 与本轮调度请求不一致："
+                f"batch={self.input_batch.req_ids}, "
+                f"scheduled={list(scheduler_output.num_scheduled_tokens)}"
+            )
+
+    def _bookkeeping_after_sample(
+        self,
+        scheduler_output,
+        req_ids: list[str],
+        sampled_token_ids: list[list[int]],
+    ) -> None:
+        """模型执行成功后提交 computed 进度与新采样 token。"""
+
+        assert self.input_batch is not None
+        for req_id, sampled_ids in zip(
+            req_ids, sampled_token_ids, strict=True
+        ):
+            req_state = self.requests[req_id]
+            num_scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            req_state.num_computed_tokens += num_scheduled
+            req_index = self.input_batch.req_id_to_index[req_id]
+            self.input_batch.num_computed_tokens_cpu[req_index] = (
+                req_state.num_computed_tokens
+            )
+            if sampled_ids:
+                req_state.output_token_ids.extend(sampled_ids)
+                self.input_batch.append_output_token_ids(req_id, sampled_ids)
+
     def execute_model(self, scheduler_output):
-        """InputBatch 尚未实现，继续使用可验证控制面的确定性 mock 采样。"""
+        """更新 InputBatch；暂用确定性 token 代替下一阶段的真实 model/sample。"""
         from my_vllm.v1.core.sched.output import ModelRunnerOutput
 
-        req_ids = list(scheduler_output.num_scheduled_tokens.keys())
-        sampled_token_ids = []
+        self._update_states(scheduler_output)
+        assert self.input_batch is not None
+        req_ids = self.input_batch.req_ids
+        sampled_token_ids: list[list[int]] = []
         for req_id in req_ids:
-            count = self._req_output_counts.get(req_id, 0)
-            sampled_token_ids.append([ord("a") + count % 26])
-            self._req_output_counts[req_id] = count + 1
-        for req_id in scheduler_output.finished_req_ids:
-            self._req_output_counts.pop(req_id, None)
+            req_state = self.requests[req_id]
+            num_scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            reaches_known_sequence_end = (
+                req_state.num_computed_tokens + num_scheduled
+                >= req_state.num_tokens
+            )
+            if reaches_known_sequence_end:
+                token_id = ord("a") + len(req_state.output_token_ids) % 26
+                sampled_token_ids.append([token_id])
+            else:
+                # chunked prefill 的非末 chunk 只写 KV，不产生采样 token。
+                sampled_token_ids.append([])
+
+        self._bookkeeping_after_sample(
+            scheduler_output, req_ids, sampled_token_ids
+        )
         return ModelRunnerOutput(
             req_ids=req_ids,
             sampled_token_ids=sampled_token_ids,

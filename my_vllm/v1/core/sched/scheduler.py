@@ -62,6 +62,9 @@ class Scheduler:
 
         # 本轮/上轮之间结束的请求 id（由 EngineCore 消费后清空）
         self.finished_req_ids: set[str] = set()
+        # Worker 也必须收到一次 finished 通知。EngineCore 会先消费上面的集合，
+        # 因而不能让两个消费者共用同一个 set。
+        self._finished_req_ids_to_notify: set[str] = set()
 
         self.current_step = 0
 
@@ -75,7 +78,7 @@ class Scheduler:
         if request.num_prompt_tokens > self.max_model_len:
             request.status = RequestStatus.FINISHED_IGNORED
             self.requests[request.request_id] = request # 调度器的总表目记录一下
-            self.finished_req_ids.add(request.request_id) # 然后直接加入已经完成的req
+            self._mark_finished(request.request_id)
             logger.warning(
                 "请求 %s prompt 超长（%d > %d），忽略",
                 request.request_id, request.num_prompt_tokens, self.max_model_len,
@@ -99,7 +102,7 @@ class Scheduler:
             if request in self.running:
                 self.running.remove(request)
             self.kv_cache_manager.free(request)
-            self.finished_req_ids.add(req_id)
+            self._mark_finished(req_id)
 
     # ==================================================================
     # 调度主流程
@@ -247,6 +250,8 @@ class Scheduler:
             NewRequestData(
                 req_id=r.request_id, # 每个请求的ID
                 prompt_token_ids=r.prompt_token_ids, # 每个req的 原始 prompt 的 token ids 序列 #
+                output_token_ids=list(r.output_token_ids),
+                sampling_params=r.sampling_params,
                 block_ids=req_to_new_blocks[r.request_id], # 每个group的完整block table
                 num_computed_tokens=r.num_computed_tokens, # 每个req的已经计算的tokens数量
                 max_tokens=r.max_tokens, # 这个req的最大总长度
@@ -259,13 +264,15 @@ class Scheduler:
             # 本轮继续运行的req集合，每个req的本轮的计算tokens数量，每个req的本轮新增的block列表
         )
 
+        finished_req_ids = set(self._finished_req_ids_to_notify)
+        self._finished_req_ids_to_notify.clear()
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data, # 本轮新增的req的集合
             scheduled_cached_reqs=cached_reqs_data, # 本轮的继续running的req集合
             num_scheduled_tokens=num_scheduled_tokens, # 这边传入的本轮的每个req需要计算的token数
 
             total_num_scheduled_tokens=total_num_scheduled_tokens, # batch的总共tokens数
-            finished_req_ids=set(self.finished_req_ids), # 上一轮update_from_output里面判定已经执行结束了，这次也通知一下worker
+            finished_req_ids=finished_req_ids,
 
             # 这一批的req之间，互相共享的 公共前缀长度；不是各自命中前缀缓存的最大值
             # 这里是为了cascade attention， 这是本轮batch，他们都面临同样的K矩阵，V矩阵，对于这个公共前缀长度
@@ -319,11 +326,17 @@ class Scheduler:
             stopped = self._update_request_with_output(request, new_token_ids)
             if stopped:
                 self.kv_cache_manager.free(request)
-                self.finished_req_ids.add(req_id)
+                self._mark_finished(req_id)
                 if request in self.running:
                     self.running.remove(request)
 
         return outputs
+
+    def _mark_finished(self, req_id: str) -> None:
+        """分别登记给 EngineCore 输出消费者和 Worker 状态消费者。"""
+
+        self.finished_req_ids.add(req_id)
+        self._finished_req_ids_to_notify.add(req_id)
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]

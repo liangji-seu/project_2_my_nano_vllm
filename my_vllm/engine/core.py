@@ -354,7 +354,12 @@ class EngineCoreProc(EngineCore):
             # 3) 执行：通过 executor.collective_rpc 把 scheduler_output 广播给所有
             #    worker，worker 执行「前向 + 采样」后回传 ModelRunnerOutput。
             #    （worker 侧 forward 目前是 mock，见 GPUModelRunner.execute_model）
-            if scheduler_output.total_num_scheduled_tokens > 0:
+            # 即使本轮没有 token，只要有 finished 通知也必须 RPC 一次，让
+            # Worker 清掉 CachedRequestState/InputBatch 槽位。
+            if (
+                scheduler_output.total_num_scheduled_tokens > 0
+                or scheduler_output.finished_req_ids
+            ):
                 model_runner_output = self.model_executor.execute_model(scheduler_output)
                 # 调试日志：打印本轮 collective_rpc 回传的采样结果，直观确认执行器链路生效
                 sampled_text = {
@@ -365,7 +370,10 @@ class EngineCoreProc(EngineCore):
                     )
                 }
                 logger.info("[RPC] execute_model 本轮采样结果: %s", sampled_text)
-                self.scheduler.update_from_output(scheduler_output, model_runner_output)
+                if scheduler_output.total_num_scheduled_tokens > 0:
+                    self.scheduler.update_from_output(
+                        scheduler_output, model_runner_output
+                    )
 
             # 4) 回传已结束请求的输出
             self._send_finished_outputs()
