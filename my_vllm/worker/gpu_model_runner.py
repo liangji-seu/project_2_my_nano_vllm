@@ -220,16 +220,17 @@ class GPUModelRunner:
             ),
         )
         vocab_size = int(self.hf_config["vocab_size"])
-        input_ids = torch.randint(0, vocab_size, (1, num_tokens), device=self.device)
-        hidden_states = self.model(input_ids)
+        input_ids = torch.randint(0, vocab_size, (num_tokens,), device=self.device)
+        positions = torch.arange(num_tokens, device=self.device, dtype=torch.int64)
+        hidden_states = self.model(input_ids, positions)
         # vLLM 只对需要采样的位置算 logits。这里取最多 max_num_seqs 个末尾
         # hidden state，覆盖 logits/sampler 峰值但不引入 InputBatch 状态。
         num_sampled_positions = min(self.vllm_config.max_num_seqs, num_tokens)
-        logits = self.model.compute_logits(hidden_states[:, -num_sampled_positions:, :])
+        logits = self.model.compute_logits(hidden_states[-num_sampled_positions:])
         _ = torch.argmax(logits, dim=-1)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
-        del input_ids, hidden_states, logits
+        del input_ids, positions, hidden_states, logits
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """按 KVCacheTensor 分配 byte buffer，再 reshape 出 block 第一维。"""
@@ -306,6 +307,18 @@ class GPUModelRunner:
 
     def get_model(self) -> nn.Module | None:
         return self.model
+
+    @torch.inference_mode()
+    def model_forward(self, model_inputs: ModelForwardInputs) -> torch.Tensor:
+        """直接执行已经 preprocess 好的扁平 Qwen2 输入。"""
+
+        if self.model is None:
+            raise RuntimeError("必须先 load_model，再执行真实模型前向")
+        return self.model(
+            input_ids=model_inputs.input_ids,
+            positions=model_inputs.positions,
+            attention_metadata=model_inputs.attention_metadata,
+        )
 
     def _update_states(self, scheduler_output) -> None:
         """用 SchedulerOutput 增量更新请求缓存和持久 InputBatch。"""

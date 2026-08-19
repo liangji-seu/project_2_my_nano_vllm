@@ -12,6 +12,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from my_vllm.attention.metadata import (
+    FullAttentionMetadata,
+    FullAttentionMetadataCollection,
+)
+
 
 @dataclass(frozen=True)
 class Qwen2Config:
@@ -83,9 +88,15 @@ class Qwen2Attention(nn.Module):
         self.kv_cache: torch.Tensor | None = None
 
     def _apply_rope(
-        self, q: torch.Tensor, k: torch.Tensor
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        seq_len = q.shape[-2]
+        """对扁平 token 使用外部绝对 positions 计算 RoPE。"""
+
+        if positions.ndim != 1 or positions.shape[0] != q.shape[0]:
+            raise ValueError("positions 必须是与扁平 token 一一对应的一维张量")
         inv_freq = 1.0 / (
             self.rope_theta
             ** (
@@ -95,30 +106,76 @@ class Qwen2Attention(nn.Module):
                 / self.head_dim
             )
         )
-        positions = torch.arange(seq_len, device=q.device, dtype=torch.float32)
-        freqs = torch.outer(positions, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)[None, None, :, :]
+        freqs = torch.outer(positions.to(torch.float32), inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)[:, None, :]
         cos, sin = emb.cos().to(q.dtype), emb.sin().to(q.dtype)
         return q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, _ = hidden_states.shape
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        attention_metadata: FullAttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        """基础 PyTorch FullAttention，只处理完整的当前 prefill。
+
+        输入始终是 ``[total_num_tokens, hidden_size]``。当 metadata 包含多个
+        请求时，用 block-diagonal causal mask 隔离各请求。历史 KV 的分页读写
+        属于下一阶段；因此 context_lens 非零时显式拒绝执行。
+        """
+
+        if hidden_states.ndim != 2:
+            raise ValueError("Qwen2Attention 只接受 [total_tokens, hidden_size]")
+        num_tokens = hidden_states.shape[0]
         q = self.q_proj(hidden_states).view(
-            batch, seq_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)
+            num_tokens, self.num_heads, self.head_dim
+        )
         k = self.k_proj(hidden_states).view(
-            batch, seq_len, self.num_kv_heads, self.head_dim
-        ).transpose(1, 2)
+            num_tokens, self.num_kv_heads, self.head_dim
+        )
         v = self.v_proj(hidden_states).view(
-            batch, seq_len, self.num_kv_heads, self.head_dim
-        ).transpose(1, 2)
-        q, k = self._apply_rope(q, k)
+            num_tokens, self.num_kv_heads, self.head_dim
+        )
+        q, k = self._apply_rope(q, k, positions)
         repeats = self.num_heads // self.num_kv_heads
         if repeats != 1:
             k = k.repeat_interleave(repeats, dim=1)
             v = v.repeat_interleave(repeats, dim=1)
-        output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+
+        q = q.transpose(0, 1)  # [num_heads, total_tokens, head_dim]
+        k = k.transpose(0, 1)
+        v = v.transpose(0, 1)
+        if attention_metadata is None:
+            output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            if attention_metadata.num_actual_tokens != num_tokens:
+                raise ValueError("metadata token 数与 hidden_states 不一致")
+            if bool((attention_metadata.context_lens != 0).any().item()):
+                raise NotImplementedError(
+                    "基础 FullAttention 尚未读取历史 KV；"
+                    "num_computed_tokens > 0 需要下一阶段的 KV Cache Attention"
+                )
+            req_indices = torch.repeat_interleave(
+                torch.arange(
+                    attention_metadata.num_reqs,
+                    device=hidden_states.device,
+                    dtype=torch.int64,
+                ),
+                attention_metadata.query_lens.to(torch.int64),
+            )
+            if req_indices.numel() != num_tokens:
+                raise ValueError("query_lens 之和与扁平 token 数不一致")
+            same_request = req_indices[:, None] == req_indices[None, :]
+            causal = positions[:, None] >= positions[None, :]
+            attention_mask = same_request & causal
+            output = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attention_mask,
+                is_causal=False,
+            )
+        output = output.transpose(0, 1).contiguous().view(num_tokens, -1)
         return self.o_proj(output)
 
 
@@ -143,8 +200,15 @@ class Qwen2DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        attention_metadata: FullAttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        x = x + self.self_attn(
+            self.input_layernorm(x), positions, attention_metadata
+        )
         return x + self.mlp(self.post_attention_layernorm(x))
 
 
@@ -157,10 +221,30 @@ class Qwen2Model(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        attention_metadata: FullAttentionMetadataCollection | None = None,
+    ) -> torch.Tensor:
+        if input_ids.ndim != 1:
+            raise ValueError("Qwen2Model 只接受扁平 input_ids: [total_num_tokens]")
+        if positions is None:
+            positions = torch.arange(
+                input_ids.shape[0], device=input_ids.device, dtype=torch.int64
+            )
+        if positions.shape != input_ids.shape:
+            raise ValueError("positions 必须与 input_ids 形状一致")
         hidden_states = self.embed_tokens(input_ids)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states)
+        for index, layer in enumerate(self.layers):
+            layer_metadata = (
+                None
+                if attention_metadata is None
+                else attention_metadata.for_layer(
+                    f"model.layers.{index}.self_attn"
+                )
+            )
+            hidden_states = layer(hidden_states, positions, layer_metadata)
         return self.norm(hidden_states)
 
 
@@ -175,10 +259,15 @@ class Qwen2ForCausalLM(nn.Module):
         else:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        attention_metadata: FullAttentionMetadataCollection | None = None,
+    ) -> torch.Tensor:
         # 与 vLLM 模型接口一致：forward 返回 hidden states，logits 单独计算，
         # 避免为 batch 内每个 token 都物化 vocab-size logits。
-        return self.model(input_ids)
+        return self.model(input_ids, positions, attention_metadata)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

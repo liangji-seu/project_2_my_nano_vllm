@@ -6,9 +6,19 @@ torch = pytest.importorskip("torch")
 safetensors_torch = pytest.importorskip("safetensors.torch")
 
 from my_vllm.config import EngineConfig
+from my_vllm.attention.metadata import (
+    FullAttentionMetadata,
+    FullAttentionMetadataCollection,
+)
 from my_vllm.model_executor.model_loader import load_model
 from my_vllm.model_executor.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
+from my_vllm.v1.core.sched.output import (
+    CachedRequestData,
+    NewRequestData,
+    SchedulerOutput,
+)
 from my_vllm.v1.kv_cache_interface import FullAttentionSpec, generate_kv_cache_config
+from my_vllm.v1.request import SamplingParams
 from my_vllm.worker.gpu_model_runner import GPUModelRunner
 
 
@@ -98,3 +108,100 @@ def test_profile_and_kv_cache_block_view_without_input_batch(tmp_path):
             spec.head_size,
         )
         assert dict(runner.model.attention_layers())[layer_name].kv_cache is cache
+
+
+def make_flat_attention_metadata(model, query_lens):
+    num_reqs = len(query_lens)
+    num_tokens = sum(query_lens)
+    query_start = [0]
+    for query_len in query_lens:
+        query_start.append(query_start[-1] + query_len)
+    positions = torch.cat(
+        [torch.arange(query_len) for query_len in query_lens]
+    )
+    metadata = FullAttentionMetadata(
+        kv_cache_group_id=0,
+        layer_names=tuple(name for name, _ in model.attention_layers()),
+        block_size=4,
+        causal=True,
+        num_reqs=num_reqs,
+        num_actual_tokens=num_tokens,
+        max_query_len=max(query_lens),
+        max_seq_len=max(query_lens),
+        query_start_loc=torch.tensor(query_start, dtype=torch.int32),
+        seq_lens=torch.tensor(query_lens, dtype=torch.int32),
+        num_computed_tokens=torch.zeros(num_reqs, dtype=torch.int32),
+        num_scheduled_tokens=torch.tensor(query_lens, dtype=torch.int32),
+        positions=positions,
+        block_table=torch.zeros((num_reqs, 2), dtype=torch.int32),
+        slot_mapping=torch.arange(num_tokens, dtype=torch.int64),
+    )
+    return positions, FullAttentionMetadataCollection(
+        by_group={0: metadata},
+        by_layer={name: metadata for name in metadata.layer_names},
+    )
+
+
+def test_qwen2_flat_ragged_batch_matches_separate_prefills():
+    torch.manual_seed(11)
+    model = Qwen2ForCausalLM(Qwen2Config.from_dict(tiny_hf_config())).eval()
+    first = torch.tensor([1, 2, 3], dtype=torch.int64)
+    second = torch.tensor([4, 5], dtype=torch.int64)
+    flat_input_ids = torch.cat((first, second))
+    positions, metadata = make_flat_attention_metadata(model, [3, 2])
+
+    flat_hidden = model(flat_input_ids, positions, metadata)
+    expected = torch.cat((model(first), model(second)))
+
+    assert flat_hidden.shape == (5, 16)
+    torch.testing.assert_close(flat_hidden, expected, rtol=1e-5, atol=1e-6)
+    assert model.compute_logits(flat_hidden).shape == (5, 32)
+
+
+def test_preprocessed_flat_inputs_run_real_tiny_qwen2(tmp_path):
+    config_dict = tiny_hf_config()
+    write_checkpoint(tmp_path, config_dict)
+    engine_config = EngineConfig(
+        model=str(tmp_path),
+        dtype="float32",
+        max_model_len=16,
+        max_num_seqs=4,
+        max_num_batched_tokens=8,
+        block_size=4,
+    )
+    runner = GPUModelRunner(engine_config, torch.device("cpu"))
+    runner.load_model()
+    specs = runner.get_kv_cache_spec()
+    per_block = sum(spec.page_size_bytes for spec in specs.values())
+    runner.initialize_kv_cache(
+        generate_kv_cache_config(specs, available_memory=per_block * 8)
+    )
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[
+            NewRequestData(
+                req_id="request",
+                prompt_token_ids=[1, 2, 3],
+                output_token_ids=[],
+                sampling_params=SamplingParams(max_tokens=2),
+                block_ids=([1],),
+                num_computed_tokens=0,
+                max_tokens=2,
+            )
+        ],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={"request": 3},
+        total_num_scheduled_tokens=3,
+        finished_req_ids=set(),
+    )
+
+    runner.execute_model(scheduler_output)
+    assert runner.last_model_inputs is not None
+    hidden_states = runner.model_forward(runner.last_model_inputs)
+    sample_hidden_states = hidden_states[
+        runner.last_model_inputs.logits_indices
+    ]
+    logits = runner.model.compute_logits(sample_hidden_states)
+
+    assert hidden_states.shape == (3, 16)
+    assert sample_hidden_states.shape == (1, 16)
+    assert logits.shape == (1, 32)
