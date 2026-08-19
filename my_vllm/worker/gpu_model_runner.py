@@ -8,9 +8,33 @@ import torch
 import torch.nn as nn
 
 from my_vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+from my_vllm.worker.cpu_gpu_buffer import CpuGpuBuffer
 from my_vllm.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 logger = logging.getLogger(__name__)
+
+
+class PreparedInputBuffers:
+    """本轮已经整理好的模型输入视图，不包含 Attention metadata。"""
+
+    def __init__(
+        self,
+        *,
+        num_reqs: int,
+        num_tokens: int,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        slot_mappings: dict[int, torch.Tensor],
+    ) -> None:
+        self.num_reqs = num_reqs
+        self.num_tokens = num_tokens
+        self.input_ids = input_ids
+        self.positions = positions
+        self.query_start_loc = query_start_loc
+        self.seq_lens = seq_lens
+        self.slot_mappings = slot_mappings
 
 
 class GPUModelRunner:
@@ -32,6 +56,62 @@ class GPUModelRunner:
         self.requests: dict[str, CachedRequestState] = {}
         # KV cache group 数要到 initialize_kv_cache 才能确定，因此延迟构造。
         self.input_batch: InputBatch | None = None
+        self.max_num_tokens = vllm_config.max_num_batched_tokens
+        self.max_num_reqs = vllm_config.max_num_seqs
+
+        # 每个 step 都会覆写的固定地址工作缓冲。InputBatch 保存跨 step 状态，
+        # 这些字段只描述当前 SchedulerOutput 的扁平化快照。
+        self.input_ids = self._make_buffer(self.max_num_tokens, torch.int32)
+        self.is_token_ids = self._make_buffer(
+            self.max_num_tokens, torch.bool, fill_value=True
+        )
+        # 当前请求协议不接受 prompt embeds；后续接入时再按 hidden_size 分配。
+        self.inputs_embeds: CpuGpuBuffer | None = None
+        self.token_indices = self._make_buffer(self.max_num_tokens, torch.int64)
+        self.req_indices = self._make_buffer(self.max_num_tokens, torch.int64)
+        self.query_pos = self._make_buffer(self.max_num_tokens, torch.int64)
+        self.query_start_loc = self._make_buffer(self.max_num_reqs + 1, torch.int32)
+        self.prev_positions = self._make_buffer(
+            self.max_num_reqs, torch.int64, fill_value=-1
+        )
+        self.num_scheduled_tokens = self._make_buffer(
+            self.max_num_reqs, torch.int32
+        )
+        self.prev_num_draft_tokens = self._make_buffer(
+            self.max_num_reqs, torch.int32
+        )
+        self.num_decode_draft_tokens = self._make_buffer(
+            self.max_num_reqs, torch.int32, fill_value=-1
+        )
+        self.num_accepted_tokens = self._make_buffer(
+            self.max_num_reqs, torch.int32, fill_value=1
+        )
+
+        # vLLM 直接在 GPU 上计算这三项，供 RoPE/Attention 使用。
+        self.positions = torch.zeros(
+            self.max_num_tokens, dtype=torch.int64, device=device
+        )
+        self.seq_lens = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device=device
+        )
+        self.num_computed_tokens = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device=device
+        )
+        # 每个 KV group 一份；initialize_kv_cache 后才能确定 group 数和块大小。
+        self.slot_mappings: dict[int, CpuGpuBuffer] = {}
+        self._previous_batch_req_id_to_index: dict[str, int] = {}
+        self.last_prepared_inputs: PreparedInputBuffers | None = None
+
+    def _make_buffer(
+        self,
+        shape,
+        dtype: torch.dtype,
+        *,
+        fill_value: int | float | bool = 0,
+    ) -> CpuGpuBuffer:
+        return CpuGpuBuffer(
+            shape, dtype=dtype, device=self.device, fill_value=fill_value
+        )
 
     @property
     def is_mock_model(self) -> bool:
@@ -177,7 +257,12 @@ class GPUModelRunner:
             max_num_reqs=self.vllm_config.max_num_seqs,
             max_model_len=self.vllm_config.max_model_len,
             num_kv_cache_groups=len(kv_cache_config.kv_cache_groups),
+            pin_memory=self.device.type == "cuda",
         )
+        self.slot_mappings = {
+            group_id: self._make_buffer(self.max_num_tokens, torch.int64)
+            for group_id in range(len(kv_cache_config.kv_cache_groups))
+        }
         logger.info(
             "KV Cache 物理初始化完成：layers=%d, blocks=%d, bytes=%.2f GiB",
             len(self.kv_caches),
@@ -193,6 +278,12 @@ class GPUModelRunner:
 
         if self.input_batch is None:
             raise RuntimeError("必须先 initialize_kv_cache，再执行模型")
+
+        # _prepare_inputs 用它表达“当前 batch 槽位 -> 上一 batch 槽位”。必须在
+        # remove/condense/add 改变 InputBatch 之前拍快照。
+        self._previous_batch_req_id_to_index = dict(
+            self.input_batch.req_id_to_index
+        )
 
         # 1. 已结束请求：完整状态与 batch 槽位一起释放。
         for req_id in scheduler_output.finished_req_ids:
@@ -270,6 +361,169 @@ class GPUModelRunner:
                 f"scheduled={list(scheduler_output.num_scheduled_tokens)}"
             )
 
+    def _prepare_inputs(self, scheduler_output) -> PreparedInputBuffers:
+        """把持久 InputBatch 整理成本轮扁平 CPU/GPU 工作缓冲。
+
+        此方法止步于 token/位置/计数/slot mapping；Attention metadata 和
+        ``model()`` 输入对象由后续阶段基于这些缓冲构建。
+        """
+
+        if self.input_batch is None or self.kv_cache_config is None:
+            raise RuntimeError("必须先 initialize_kv_cache，再准备模型输入")
+
+        req_ids = self.input_batch.req_ids
+        num_reqs = len(req_ids)
+        if num_reqs > self.max_num_reqs:
+            raise RuntimeError("本轮请求数超过预分配容量")
+
+        scheduled_counts = [
+            int(scheduler_output.num_scheduled_tokens[req_id])
+            for req_id in req_ids
+        ]
+        total_num_tokens = sum(scheduled_counts)
+        if total_num_tokens != scheduler_output.total_num_scheduled_tokens:
+            raise ValueError("SchedulerOutput total_num_scheduled_tokens 不一致")
+        if total_num_tokens > self.max_num_tokens:
+            raise RuntimeError("本轮 token 数超过预分配容量")
+
+        # 请求级计数与前后 batch 槽位映射。
+        cumulative = 0
+        self.query_start_loc.np[0] = 0
+        token_cursor = 0
+        for req_index, (req_id, num_scheduled) in enumerate(
+            zip(req_ids, scheduled_counts, strict=True)
+        ):
+            if num_scheduled <= 0:
+                raise ValueError(f"请求 {req_id} 的 num_scheduled_tokens 必须大于 0")
+            num_computed = int(
+                self.input_batch.num_computed_tokens_cpu[req_index]
+            )
+            seq_len = num_computed + num_scheduled
+            if seq_len > self.vllm_config.max_model_len:
+                raise ValueError(f"请求 {req_id} 本轮 seq_len 超过 max_model_len")
+
+            self.num_scheduled_tokens.np[req_index] = num_scheduled
+            self.prev_positions.np[req_index] = (
+                self._previous_batch_req_id_to_index.get(req_id, -1)
+            )
+            self.prev_num_draft_tokens.np[req_index] = 0
+            self.num_decode_draft_tokens.np[req_index] = -1
+            self.num_accepted_tokens.np[req_index] = int(
+                self.input_batch.num_accepted_tokens_cpu[req_index]
+            )
+
+            cumulative += num_scheduled
+            self.query_start_loc.np[req_index + 1] = cumulative
+            for local_query_pos in range(num_scheduled):
+                flat_index = token_cursor + local_query_pos
+                absolute_position = num_computed + local_query_pos
+                self.req_indices.np[flat_index] = req_index
+                self.query_pos.np[flat_index] = local_query_pos
+                self.token_indices.np[flat_index] = (
+                    req_index * self.vllm_config.max_model_len
+                    + absolute_position
+                )
+            token_cursor += num_scheduled
+
+        # 固定容量缓冲的尾部也写成稳定哨兵值，方便 CUDA graph 后续复用。
+        self.query_start_loc.np[num_reqs + 1 :].fill(total_num_tokens)
+        self.prev_positions.np[num_reqs:].fill(-1)
+        self.prev_num_draft_tokens.np[num_reqs:].fill(0)
+        self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
+        self.num_accepted_tokens.np[num_reqs:].fill(1)
+        self.num_scheduled_tokens.np[num_reqs:].fill(0)
+
+        # 二维持久 token 表 -> 本轮一维 input_ids/is_token_ids。
+        if total_num_tokens:
+            token_indices_tensor = self.token_indices.cpu[:total_num_tokens]
+            torch.index_select(
+                self.input_batch.token_ids_cpu_tensor.flatten(),
+                0,
+                token_indices_tensor,
+                out=self.input_ids.cpu[:total_num_tokens],
+            )
+            torch.index_select(
+                self.input_batch.is_token_ids_tensor.flatten(),
+                0,
+                token_indices_tensor,
+                out=self.is_token_ids.cpu[:total_num_tokens],
+            )
+
+        # CPU 工作结果搬到执行设备。
+        for buffer in (
+            self.input_ids,
+            self.is_token_ids,
+            self.token_indices,
+            self.req_indices,
+            self.query_pos,
+        ):
+            buffer.copy_to_gpu(total_num_tokens)
+        for buffer in (
+            self.query_start_loc,
+            self.prev_positions,
+            self.num_scheduled_tokens,
+            self.prev_num_draft_tokens,
+            self.num_decode_draft_tokens,
+            self.num_accepted_tokens,
+        ):
+            buffer.copy_to_gpu()
+
+        if num_reqs:
+            self.num_computed_tokens[:num_reqs].copy_(
+                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                non_blocking=self.device.type == "cuda",
+            )
+            req_indices_gpu = self.req_indices.gpu[:total_num_tokens]
+            self.positions[:total_num_tokens] = (
+                self.num_computed_tokens[req_indices_gpu].to(torch.int64)
+                + self.query_pos.gpu[:total_num_tokens]
+            )
+            self.seq_lens[:num_reqs] = (
+                self.num_computed_tokens[:num_reqs]
+                + self.num_scheduled_tokens.gpu[:num_reqs]
+            )
+        self.num_computed_tokens[num_reqs:].zero_()
+        self.seq_lens[num_reqs:].zero_()
+
+        # 写 KV 的地址：slot = physical_block_id * block_size + block_offset。
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            block_size = group.kv_cache_spec.block_size
+            slot_buffer = self.slot_mappings[group_id]
+            for flat_index in range(total_num_tokens):
+                req_index = int(self.req_indices.np[flat_index])
+                position = int(
+                    self.input_batch.num_computed_tokens_cpu[req_index]
+                    + self.query_pos.np[flat_index]
+                )
+                logical_block = position // block_size
+                block_offset = position % block_size
+                block_ids = self.input_batch.block_table[group_id][req_index]
+                if logical_block >= len(block_ids):
+                    raise RuntimeError(
+                        "block table 无法覆盖本轮 token："
+                        f"group={group_id}, req={req_ids[req_index]}, "
+                        f"position={position}, blocks={block_ids}"
+                    )
+                slot_buffer.np[flat_index] = (
+                    block_ids[logical_block] * block_size + block_offset
+                )
+            slot_buffer.copy_to_gpu(total_num_tokens)
+
+        prepared = PreparedInputBuffers(
+            num_reqs=num_reqs,
+            num_tokens=total_num_tokens,
+            input_ids=self.input_ids.gpu[:total_num_tokens],
+            positions=self.positions[:total_num_tokens],
+            query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
+            seq_lens=self.seq_lens[:num_reqs],
+            slot_mappings={
+                group_id: buffer.gpu[:total_num_tokens]
+                for group_id, buffer in self.slot_mappings.items()
+            },
+        )
+        self.last_prepared_inputs = prepared
+        return prepared
+
     def _bookkeeping_after_sample(
         self,
         scheduler_output,
@@ -294,11 +548,15 @@ class GPUModelRunner:
                 self.input_batch.append_output_token_ids(req_id, sampled_ids)
 
     def execute_model(self, scheduler_output):
-        """更新 InputBatch；暂用确定性 token 代替下一阶段的真实 model/sample。"""
+        """准备本轮输入；暂用确定性 token 代替下一阶段的真实 model/sample。"""
         from my_vllm.v1.core.sched.output import ModelRunnerOutput
 
         self._update_states(scheduler_output)
         assert self.input_batch is not None
+        if scheduler_output.total_num_scheduled_tokens:
+            self._prepare_inputs(scheduler_output)
+        else:
+            self.last_prepared_inputs = None
         req_ids = self.input_batch.req_ids
         sampled_token_ids: list[list[int]] = []
         for req_id in req_ids:

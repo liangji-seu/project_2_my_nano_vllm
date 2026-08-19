@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+
 from my_vllm.v1.request import SamplingParams
 from my_vllm.worker.block_table import MultiGroupBlockTable
 
@@ -48,6 +50,7 @@ class InputBatch:
         max_num_reqs: int,
         max_model_len: int,
         num_kv_cache_groups: int,
+        pin_memory: bool = False,
     ):
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
@@ -55,17 +58,48 @@ class InputBatch:
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
 
-        # 可读性优先的 CPU 缓冲；后续 _prepare_inputs 再把当前步切片复制到 GPU。
-        self.token_ids_cpu = [
-            [0] * max_model_len for _ in range(max_num_reqs)
-        ]
+        # 跨 step 持久化的二维 CPU token 表；ModelRunner 每轮用 token_indices
+        # 从中抽取本轮 query，整理成扁平 input_ids。
+        self.token_ids_cpu_tensor = torch.zeros(
+            (max_num_reqs, max_model_len),
+            dtype=torch.int32,
+            pin_memory=pin_memory,
+        )
+        self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
+        # 当前请求协议只有 token ids，没有 prompt embeds。仍保留该掩码，使后续
+        # 接入 embeddings 时无需改变 _prepare_inputs 的数据模型。
+        self.is_token_ids_tensor = torch.ones(
+            (max_num_reqs, max_model_len),
+            dtype=torch.bool,
+            pin_memory=pin_memory,
+        )
         self.req_output_token_ids: list[list[int] | None] = []
-        self.num_tokens_no_spec = [0] * max_num_reqs
-        self.num_prompt_tokens = [0] * max_num_reqs
-        self.num_computed_tokens_cpu = [0] * max_num_reqs
+        self.num_tokens_no_spec_tensor = torch.zeros(
+            max_num_reqs, dtype=torch.int32, pin_memory=pin_memory
+        )
+        self.num_tokens_no_spec = self.num_tokens_no_spec_tensor.numpy()
+        self.num_prompt_tokens_tensor = torch.zeros(
+            max_num_reqs, dtype=torch.int32, pin_memory=pin_memory
+        )
+        self.num_prompt_tokens = self.num_prompt_tokens_tensor.numpy()
+        self.num_computed_tokens_cpu_tensor = torch.zeros(
+            max_num_reqs, dtype=torch.int32, pin_memory=pin_memory
+        )
+        self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
+        # baseline 没有投机解码：每轮有效输出数固定为 1。
+        self.num_accepted_tokens_cpu_tensor = torch.ones(
+            max_num_reqs, dtype=torch.int32, pin_memory=pin_memory
+        )
+        self.num_accepted_tokens_cpu = self.num_accepted_tokens_cpu_tensor.numpy()
 
-        self.temperature = [0.0] * max_num_reqs
-        self.top_p = [1.0] * max_num_reqs
+        self.temperature_tensor = torch.zeros(
+            max_num_reqs, dtype=torch.float32, pin_memory=pin_memory
+        )
+        self.temperature = self.temperature_tensor.numpy()
+        self.top_p_tensor = torch.ones(
+            max_num_reqs, dtype=torch.float32, pin_memory=pin_memory
+        )
+        self.top_p = self.top_p_tensor.numpy()
 
         self.block_table = MultiGroupBlockTable(
             max_num_reqs=max_num_reqs,
@@ -104,9 +138,11 @@ class InputBatch:
         self.req_id_to_index[request.req_id] = req_index
         token_ids = request.all_token_ids
         self.token_ids_cpu[req_index][: len(token_ids)] = token_ids
+        self.is_token_ids_tensor[req_index, : len(token_ids)] = True
         self.num_tokens_no_spec[req_index] = request.num_tokens
         self.num_prompt_tokens[req_index] = request.num_prompt_tokens
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+        self.num_accepted_tokens_cpu[req_index] = 1
         self.temperature[req_index] = request.sampling_params.temperature
         self.top_p[req_index] = request.sampling_params.top_p
         self.block_table.add_row(request.block_ids, req_index)
@@ -121,6 +157,8 @@ class InputBatch:
         self.num_tokens_no_spec[req_index] = 0
         self.num_prompt_tokens[req_index] = 0
         self.num_computed_tokens_cpu[req_index] = 0
+        self.num_accepted_tokens_cpu[req_index] = 1
+        self.is_token_ids_tensor[req_index].fill_(True)
         self.block_table.clear_row(req_index)
         return req_index
 
@@ -164,10 +202,17 @@ class InputBatch:
             self.token_ids_cpu[empty_index][:num_tokens] = self.token_ids_cpu[
                 last_index
             ][:num_tokens]
+            self.is_token_ids_tensor[empty_index, :num_tokens].copy_(
+                self.is_token_ids_tensor[last_index, :num_tokens]
+            )
+            self.is_token_ids_tensor[last_index].fill_(True)
             self.num_tokens_no_spec[empty_index] = num_tokens
             self.num_prompt_tokens[empty_index] = self.num_prompt_tokens[last_index]
             self.num_computed_tokens_cpu[empty_index] = (
                 self.num_computed_tokens_cpu[last_index]
+            )
+            self.num_accepted_tokens_cpu[empty_index] = (
+                self.num_accepted_tokens_cpu[last_index]
             )
             self.temperature[empty_index] = self.temperature[last_index]
             self.top_p[empty_index] = self.top_p[last_index]
