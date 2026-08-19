@@ -205,3 +205,72 @@ def test_preprocessed_flat_inputs_run_real_tiny_qwen2(tmp_path):
     assert hidden_states.shape == (3, 16)
     assert sample_hidden_states.shape == (1, 16)
     assert logits.shape == (1, 32)
+
+
+def test_kv_cache_prefill_and_decode_match_dense_recomputation(tmp_path):
+    """真实 execute_model 的第二步必须从分页 cache 读到第一步全部 KV。"""
+
+    config_dict = tiny_hf_config()
+    write_checkpoint(tmp_path, config_dict)
+    engine_config = EngineConfig(
+        model=str(tmp_path),
+        dtype="float32",
+        max_model_len=16,
+        max_num_seqs=2,
+        max_num_batched_tokens=8,
+        block_size=4,
+    )
+    runner = GPUModelRunner(engine_config, torch.device("cpu"))
+    runner.load_model()
+    specs = runner.get_kv_cache_spec()
+    per_block = sum(spec.page_size_bytes for spec in specs.values())
+    runner.initialize_kv_cache(
+        generate_kv_cache_config(specs, available_memory=per_block * 8)
+    )
+
+    prompt = [1, 2, 3]
+    with torch.inference_mode():
+        dense_hidden = runner.model(torch.tensor(prompt, dtype=torch.int64))
+        expected_first = int(
+            runner.model.compute_logits(dense_hidden[-1:]).argmax(dim=-1).item()
+        )
+    first = SchedulerOutput(
+        scheduled_new_reqs=[
+            NewRequestData(
+                req_id="request",
+                prompt_token_ids=prompt,
+                output_token_ids=[],
+                sampling_params=SamplingParams(max_tokens=2),
+                block_ids=([1],),
+                num_computed_tokens=0,
+                max_tokens=2,
+            )
+        ],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={"request": 3},
+        total_num_scheduled_tokens=3,
+        finished_req_ids=set(),
+    )
+    first_output = runner.execute_model(first)
+    assert first_output.sampled_token_ids == [[expected_first]]
+
+    full_ids = prompt + [expected_first]
+    with torch.inference_mode():
+        dense_hidden = runner.model(torch.tensor(full_ids, dtype=torch.int64))
+        expected_second = int(
+            runner.model.compute_logits(dense_hidden[-1:]).argmax(dim=-1).item()
+        )
+    second = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(
+            req_ids=["request"],
+            new_block_ids=[None],
+            num_computed_tokens=[3],
+            num_scheduled_tokens=[1],
+        ),
+        num_scheduled_tokens={"request": 1},
+        total_num_scheduled_tokens=1,
+        finished_req_ids=set(),
+    )
+    second_output = runner.execute_model(second)
+    assert second_output.sampled_token_ids == [[expected_second]]

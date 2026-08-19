@@ -31,6 +31,7 @@ class SamplingParams:
     max_tokens: int = 128
     temperature: float = 0.0
     top_p: float = 1.0
+    stop_token_ids: tuple[int, ...] = ()
 
 
 class FinishReason(enum.Enum):

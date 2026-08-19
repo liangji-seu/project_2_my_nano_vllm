@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from my_vllm.attention.triton_flash_attention import flash_attention_v1
 from my_vllm.attention.metadata import (
     FullAttentionMetadata,
     FullAttentionMetadataCollection,
@@ -84,7 +85,8 @@ class Qwen2Attention(nn.Module):
             config.hidden_size, self.num_kv_heads * self.head_dim, bias=bias
         )
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        # initialize_kv_cache 后由 runner 绑定；forward/InputBatch 暂不消费它。
+        # initialize_kv_cache 后由 runner 绑定，布局为
+        # [num_blocks, 2(K/V), block_size, num_kv_heads, head_dim]。
         self.kv_cache: torch.Tensor | None = None
 
     def _apply_rope(
@@ -117,11 +119,12 @@ class Qwen2Attention(nn.Module):
         positions: torch.Tensor,
         attention_metadata: FullAttentionMetadata | None = None,
     ) -> torch.Tensor:
-        """基础 PyTorch FullAttention，只处理完整的当前 prefill。
+        """扁平 Qwen2 attention：写分页 KV，再逐请求执行 FlashAttention。
 
-        输入始终是 ``[total_num_tokens, hidden_size]``。当 metadata 包含多个
-        请求时，用 block-diagonal causal mask 隔离各请求。历史 KV 的分页读写
-        属于下一阶段；因此 context_lens 非零时显式拒绝执行。
+        ``slot_mapping`` 决定当前 K/V 写到哪个物理 slot；``block_table`` 把
+        每个请求的逻辑 block 翻译成物理 block。baseline 先把分页 K/V gather
+        成连续张量，再交给 Triton FlashAttention v1；后续 PagedAttention 会把
+        gather 融进 kernel，直接读取非连续 page。
         """
 
         if hidden_states.ndim != 2:
@@ -137,24 +140,14 @@ class Qwen2Attention(nn.Module):
             num_tokens, self.num_kv_heads, self.head_dim
         )
         q, k = self._apply_rope(q, k, positions)
-        repeats = self.num_heads // self.num_kv_heads
-        if repeats != 1:
+        if attention_metadata is None:
+            repeats = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(repeats, dim=1)
             v = v.repeat_interleave(repeats, dim=1)
-
-        q = q.transpose(0, 1)  # [num_heads, total_tokens, head_dim]
-        k = k.transpose(0, 1)
-        v = v.transpose(0, 1)
-        if attention_metadata is None:
-            output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        else:
-            if attention_metadata.num_actual_tokens != num_tokens:
-                raise ValueError("metadata token 数与 hidden_states 不一致")
-            if bool((attention_metadata.context_lens != 0).any().item()):
-                raise NotImplementedError(
-                    "基础 FullAttention 尚未读取历史 KV；"
-                    "num_computed_tokens > 0 需要下一阶段的 KV Cache Attention"
-                )
+            output = flash_attention_v1(q, k, v, causal=True)
+        elif self.kv_cache is None:
+            # 独立模型单测/显存 profiling 没有初始化 KV cache。仍使用扁平
+            # block-diagonal attention，确保不同 request 绝不互相看到 token。
             req_indices = torch.repeat_interleave(
                 torch.arange(
                     attention_metadata.num_reqs,
@@ -169,14 +162,80 @@ class Qwen2Attention(nn.Module):
             causal = positions[:, None] >= positions[None, :]
             attention_mask = same_request & causal
             output = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
+                q.transpose(0, 1),
+                k.repeat_interleave(
+                    self.num_heads // self.num_kv_heads, dim=1
+                ).transpose(0, 1),
+                v.repeat_interleave(
+                    self.num_heads // self.num_kv_heads, dim=1
+                ).transpose(0, 1),
                 attn_mask=attention_mask,
                 is_causal=False,
-            )
-        output = output.transpose(0, 1).contiguous().view(num_tokens, -1)
+            ).transpose(0, 1)
+        else:
+            if attention_metadata.num_actual_tokens != num_tokens:
+                raise ValueError("metadata token 数与 hidden_states 不一致")
+            self._write_to_kv_cache(k, v, attention_metadata.slot_mapping)
+            output = self._paged_flash_attention(q, attention_metadata)
+        output = output.contiguous().view(num_tokens, -1)
         return self.o_proj(output)
+
+    def _write_to_kv_cache(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """按照线性 slot 地址把当前 token 的 K/V scatter 到物理页。"""
+
+        assert self.kv_cache is not None
+        block_size = self.kv_cache.shape[2]
+        physical_blocks = torch.div(slot_mapping, block_size, rounding_mode="floor")
+        block_offsets = slot_mapping % block_size
+        self.kv_cache[physical_blocks, 0, block_offsets] = key.to(
+            self.kv_cache.dtype
+        )
+        self.kv_cache[physical_blocks, 1, block_offsets] = value.to(
+            self.kv_cache.dtype
+        )
+
+    def _paged_flash_attention(
+        self,
+        query: torch.Tensor,
+        metadata: FullAttentionMetadata,
+    ) -> torch.Tensor:
+        """从 block table gather 历史 K/V，再运行变长 causal attention。"""
+
+        assert self.kv_cache is not None
+        output = torch.empty_like(query)
+        repeats = self.num_heads // self.num_kv_heads
+        for req_index in range(metadata.num_reqs):
+            query_start = int(metadata.query_start_loc[req_index].item())
+            query_end = int(metadata.query_start_loc[req_index + 1].item())
+            seq_len = int(metadata.seq_lens[req_index].item())
+            context_len = int(metadata.num_computed_tokens[req_index].item())
+            if query_end - query_start != seq_len - context_len:
+                raise ValueError("query 区间长度与 seq_len/context_len 不一致")
+
+            positions = torch.arange(seq_len, device=query.device)
+            logical_blocks = torch.div(
+                positions, metadata.block_size, rounding_mode="floor"
+            )
+            offsets = positions % metadata.block_size
+            physical_blocks = metadata.block_table[req_index, logical_blocks].long()
+            key = self.kv_cache[physical_blocks, 0, offsets]
+            value = self.kv_cache[physical_blocks, 1, offsets]
+            if repeats != 1:
+                key = key.repeat_interleave(repeats, dim=1)
+                value = value.repeat_interleave(repeats, dim=1)
+            output[query_start:query_end] = flash_attention_v1(
+                query[query_start:query_end],
+                key,
+                value,
+                causal=metadata.causal,
+                causal_offset=context_len,
+            )
+        return output
 
 
 class Qwen2MLP(nn.Module):

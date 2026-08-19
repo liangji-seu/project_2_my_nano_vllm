@@ -344,7 +344,12 @@ class Scheduler:
         """追加生成 token 并判定是否结束，返回 True 表示本请求结束"""
         request.append_output_token_ids(new_token_ids)
 
-        # 简化：无 EOS 检测（真实 tokenizer 接入后补充），只按长度停止
+        if (
+            new_token_ids
+            and new_token_ids[-1] in request.sampling_params.stop_token_ids
+        ):
+            request.status = RequestStatus.FINISHED_STOPPED
+            return True
         if request.num_output_tokens >= request.max_tokens:
             request.status = RequestStatus.FINISHED_LENGTH_CAPPED
             return True

@@ -56,8 +56,8 @@ class ModelForwardInputs:
 class GPUModelRunner:
     """持有一个 Worker rank 的模型和真实 KV Cache 张量。
 
-    当前已接通 ``SchedulerOutput -> CachedRequestState -> InputBatch`` 的持久状态
-    同步；真实 ``model()`` 前向与采样仍留给下一阶段。
+    接通 ``SchedulerOutput -> InputBatch -> model -> sampler -> KV cache`` 的
+    单卡同步 baseline。
     """
 
     def __init__(self, vllm_config, device: torch.device):
@@ -705,34 +705,60 @@ class GPUModelRunner:
                 self.input_batch.append_output_token_ids(req_id, sampled_ids)
 
     def execute_model(self, scheduler_output):
-        """准备本轮输入；暂用确定性 token 代替下一阶段的真实 model/sample。"""
+        """执行一次同步的准备输入、模型前向和 greedy sampling。"""
         from my_vllm.v1.core.sched.output import ModelRunnerOutput
 
         self._update_states(scheduler_output)
         assert self.input_batch is not None
+        model_inputs: ModelForwardInputs | None = None
         if scheduler_output.total_num_scheduled_tokens:
             prepared = self._prepare_inputs(scheduler_output)
             attention_metadata = self._build_attention_metadata(prepared)
-            self._preprocess(prepared, attention_metadata)
+            model_inputs = self._preprocess(prepared, attention_metadata)
         else:
             self.last_prepared_inputs = None
             self.last_attention_metadata = None
             self.last_model_inputs = None
         req_ids = self.input_batch.req_ids
-        sampled_token_ids: list[list[int]] = []
-        for req_id in req_ids:
-            req_state = self.requests[req_id]
-            num_scheduled = scheduler_output.num_scheduled_tokens[req_id]
-            reaches_known_sequence_end = (
-                req_state.num_computed_tokens + num_scheduled
-                >= req_state.num_tokens
-            )
-            if reaches_known_sequence_end:
-                token_id = ord("a") + len(req_state.output_token_ids) % 26
-                sampled_token_ids.append([token_id])
+        should_sample = [
+            self.requests[req_id].num_computed_tokens
+            + scheduler_output.num_scheduled_tokens[req_id]
+            >= self.requests[req_id].num_tokens
+            for req_id in req_ids
+        ]
+
+        if self.is_mock_model:
+            # CPU 架构测试保留可读、确定的 token 序列。
+            sampled_token_ids = [
+                [ord("a") + len(self.requests[req_id].output_token_ids) % 26]
+                if sample
+                else []
+                for req_id, sample in zip(req_ids, should_sample, strict=True)
+            ]
+        else:
+            if model_inputs is None:
+                sampled_token_ids = [[] for _ in req_ids]
             else:
-                # chunked prefill 的非末 chunk 只写 KV，不产生采样 token。
-                sampled_token_ids.append([])
+                hidden_states = self.model_forward(model_inputs)
+                sample_req_indices = [
+                    index for index, sample in enumerate(should_sample) if sample
+                ]
+                sampled_token_ids = [[] for _ in req_ids]
+                if sample_req_indices:
+                    assert self.model is not None
+                    selected_indices = model_inputs.logits_indices[
+                        sample_req_indices
+                    ]
+                    logits = self.model.compute_logits(
+                        hidden_states[selected_indices]
+                    )
+                    # baseline 只实现 greedy。argmax 后只 D2H 少量 token id，
+                    # model forward 与 FlashAttention 内部没有 host 同步。
+                    token_ids = torch.argmax(logits, dim=-1).to("cpu").tolist()
+                    for req_index, token_id in zip(
+                        sample_req_indices, token_ids, strict=True
+                    ):
+                        sampled_token_ids[req_index] = [int(token_id)]
 
         self._bookkeeping_after_sample(
             scheduler_output, req_ids, sampled_token_ids

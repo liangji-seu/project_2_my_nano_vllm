@@ -6,3 +6,6 @@ from my_vllm.attention.metadata import (
 )
 
 __all__ = ["FullAttentionMetadata", "FullAttentionMetadataCollection"]
+from my_vllm.attention.triton_flash_attention import flash_attention_v1
+
+__all__ = ["flash_attention_v1"]

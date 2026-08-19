@@ -39,6 +39,11 @@ class EngineCore:
     def __init__(self, vllm_config: EngineConfig):
         self.vllm_config = vllm_config
         self._is_running = True
+        self.tokenizer = None
+        if vllm_config.model != "test-model":
+            from my_vllm.tokenizer import HuggingFaceTokenizer
+
+            self.tokenizer = HuggingFaceTokenizer(vllm_config.model)
 
         # 创建执行器：拉起所有 worker 进程。
         # worker 的【阶段 1/3】init_device 与【阶段 2/3】load_model 在
@@ -363,7 +368,11 @@ class EngineCoreProc(EngineCore):
                 model_runner_output = self.model_executor.execute_model(scheduler_output)
                 # 调试日志：打印本轮 collective_rpc 回传的采样结果，直观确认执行器链路生效
                 sampled_text = {
-                    rid: "".join(chr(t) for t in ids)
+                    rid: (
+                        self.tokenizer.decode(ids)
+                        if self.tokenizer is not None
+                        else "".join(chr(t) for t in ids)
+                    )
                     for rid, ids in zip(
                         model_runner_output.req_ids,
                         model_runner_output.sampled_token_ids,
@@ -398,18 +407,28 @@ class EngineCoreProc(EngineCore):
     def _build_request(self, raw: dict) -> "Request":
         """把前端传来的 {request_id, prompt} 转成 Request 对象
 
-        占位 tokenizer：字符级编码（每个字符一个 token id = ord(ch)）。
-        真实实现应替换为 HuggingFace tokenizer 的 encode()。
+        test-model 使用字符级编码；真实模型使用模型目录里的 tokenizer.json。
         """
         from my_vllm.v1.request import Request, SamplingParams
 
         prompt = raw.get("prompt", "")
-        prompt_token_ids = [ord(ch) for ch in prompt]
+        prompt_token_ids = (
+            self.tokenizer.encode(prompt)
+            if self.tokenizer is not None
+            else [ord(ch) for ch in prompt]
+        )
         max_tokens = raw.get("max_tokens", self.vllm_config.max_model_len)
         return Request(
             request_id=raw["request_id"],
             prompt_token_ids=prompt_token_ids,
-            sampling_params=SamplingParams(max_tokens=max_tokens),
+            sampling_params=SamplingParams(
+                max_tokens=max_tokens,
+                stop_token_ids=(
+                    self.tokenizer.eos_token_ids
+                    if self.tokenizer is not None
+                    else ()
+                ),
+            ),
         )
 
     def _send_finished_outputs(self) -> None:
@@ -437,9 +456,9 @@ class EngineCoreProc(EngineCore):
                 req_id, finish_reason, request.num_output_tokens,
             )
 
-    @staticmethod
-    def _detokenize(token_ids: list[int]) -> str:
-        """占位 detokenizer：字符级解码（对应 _build_request 的字符级编码）"""
+    def _detokenize(self, token_ids: list[int]) -> str:
+        if self.tokenizer is not None:
+            return self.tokenizer.decode(token_ids)
         return "".join(chr(t) for t in token_ids)
 
     def shutdown(self) -> None:

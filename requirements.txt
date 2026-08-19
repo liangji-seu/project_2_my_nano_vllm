@@ -14,7 +14,7 @@ pydantic>=2.0                # 请求/响应模型校验 (FastAPI 自带，这�
 
 # --- Tokenizer (CPU only, 用于测 scheduler / block manager) ---
 # 不装 transformers (会拖 PyTorch 进来), 只装轻量的 tokenizers
-tokenizers>=0.19,<0.22       # HuggingFace Rust tokenizer, 纯 CPU, 不依赖 PyTorch
+tokenizers>=0.19             # HuggingFace Rust tokenizer, 纯 CPU, 不依赖 PyTorch
 safetensors>=0.4             # mmap 流式加载 Hugging Face safetensors 权重
 
 # --- ZMQ 通信 ---
