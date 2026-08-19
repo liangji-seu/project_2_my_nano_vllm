@@ -302,6 +302,31 @@ def test_prepare_inputs_flattens_batch_and_computes_slot_mapping():
     assert runner.is_token_ids.gpu[:3].tolist() == [True, True, True]
     assert runner.inputs_embeds is None
 
+    attention_metadata = runner.last_attention_metadata
+    assert attention_metadata is not None
+    metadata = attention_metadata.by_group[0]
+    assert metadata.causal is True
+    assert metadata.num_reqs == 2
+    assert metadata.num_actual_tokens == 3
+    assert metadata.max_query_len == 2
+    assert metadata.max_seq_len == 5
+    assert metadata.block_size == 4
+    assert metadata.query_start_loc.tolist() == [0, 2, 3]
+    assert metadata.query_lens.tolist() == [2, 1]
+    assert metadata.context_lens.tolist() == [0, 4]
+    assert metadata.seq_lens.tolist() == [2, 5]
+    assert metadata.block_table[0, :2].tolist() == [3, 0]
+    assert metadata.block_table[1, :2].tolist() == [5, 6]
+    assert metadata.slot_mapping.tolist() == [12, 13, 24]
+
+    model_inputs = runner.last_model_inputs
+    assert model_inputs is not None
+    assert model_inputs.input_ids.tolist() == [1, 2, 14]
+    assert model_inputs.inputs_embeds is None
+    assert model_inputs.positions.tolist() == [0, 1, 4]
+    assert model_inputs.logits_indices.tolist() == [1, 2]
+    assert model_inputs.attention_metadata is attention_metadata
+
     # A 离开 batch 后 B 从槽位 1 移到 0；prev_positions 保留上一批位置 1。
     second = make_output(
         cached=CachedRequestData(
@@ -347,10 +372,29 @@ def test_prepare_inputs_uses_each_kv_group_block_size_for_slots():
     runner.initialize_kv_cache(
         KVCacheConfig(
             num_blocks=16,
-            kv_cache_tensors=[KVCacheTensor(size=0), KVCacheTensor(size=0)],
+            kv_cache_tensors=[
+                KVCacheTensor(size=128, shared_by=["layer.0"]),
+                KVCacheTensor(size=256, shared_by=["layer.1"]),
+            ],
             kv_cache_groups=[
-                KVCacheGroupSpec([], FullAttentionSpec(block_size=2)),
-                KVCacheGroupSpec([], FullAttentionSpec(block_size=4)),
+                KVCacheGroupSpec(
+                    ["layer.0"],
+                    FullAttentionSpec(
+                        block_size=2,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype="float16",
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["layer.1"],
+                    FullAttentionSpec(
+                        block_size=4,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype="float16",
+                    ),
+                ),
             ],
         )
     )
@@ -363,3 +407,16 @@ def test_prepare_inputs_uses_each_kv_group_block_size_for_slots():
     assert prepared.positions.tolist() == [3, 4]
     assert prepared.slot_mappings[0].tolist() == [17, 18]
     assert prepared.slot_mappings[1].tolist() == [19, 20]
+
+    attention_metadata = runner.last_attention_metadata
+    assert attention_metadata is not None
+    group0 = attention_metadata.by_group[0]
+    group1 = attention_metadata.by_group[1]
+    assert attention_metadata.for_layer("layer.0") is group0
+    assert attention_metadata.for_layer("layer.1") is group1
+    assert group0.block_size == 2
+    assert group1.block_size == 4
+    assert group0.block_table[0, :3].tolist() == [7, 8, 9]
+    assert group1.block_table[0, :2].tolist() == [4, 5]
+    assert group0.slot_mapping.tolist() == [17, 18]
+    assert group1.slot_mapping.tolist() == [19, 20]

@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 
+from my_vllm.attention.metadata import (
+    FullAttentionMetadata,
+    FullAttentionMetadataCollection,
+)
 from my_vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from my_vllm.worker.cpu_gpu_buffer import CpuGpuBuffer
 from my_vllm.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -35,6 +40,17 @@ class PreparedInputBuffers:
         self.query_start_loc = query_start_loc
         self.seq_lens = seq_lens
         self.slot_mappings = slot_mappings
+
+
+@dataclass(frozen=True)
+class ModelForwardInputs:
+    """纯文本 decoder 模型一次前向真正消费的输入。"""
+
+    input_ids: torch.Tensor
+    inputs_embeds: None
+    positions: torch.Tensor
+    attention_metadata: FullAttentionMetadataCollection
+    logits_indices: torch.Tensor
 
 
 class GPUModelRunner:
@@ -99,8 +115,11 @@ class GPUModelRunner:
         )
         # 每个 KV group 一份；initialize_kv_cache 后才能确定 group 数和块大小。
         self.slot_mappings: dict[int, CpuGpuBuffer] = {}
+        self.block_tables: dict[int, CpuGpuBuffer] = {}
         self._previous_batch_req_id_to_index: dict[str, int] = {}
         self.last_prepared_inputs: PreparedInputBuffers | None = None
+        self.last_attention_metadata: FullAttentionMetadataCollection | None = None
+        self.last_model_inputs: ModelForwardInputs | None = None
 
     def _make_buffer(
         self,
@@ -262,6 +281,21 @@ class GPUModelRunner:
         self.slot_mappings = {
             group_id: self._make_buffer(self.max_num_tokens, torch.int64)
             for group_id in range(len(kv_cache_config.kv_cache_groups))
+        }
+        self.block_tables = {
+            group_id: self._make_buffer(
+                (
+                    self.max_num_reqs,
+                    (
+                        self.vllm_config.max_model_len
+                        + group.kv_cache_spec.block_size
+                        - 1
+                    )
+                    // group.kv_cache_spec.block_size,
+                ),
+                torch.int32,
+            )
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
         }
         logger.info(
             "KV Cache 物理初始化完成：layers=%d, blocks=%d, bytes=%.2f GiB",
@@ -524,6 +558,116 @@ class GPUModelRunner:
         self.last_prepared_inputs = prepared
         return prepared
 
+    def _build_attention_metadata(
+        self, prepared: PreparedInputBuffers
+    ) -> FullAttentionMetadataCollection:
+        """把公共输入缓冲和各 group 地址表打包成 FullAttention metadata。"""
+
+        if self.input_batch is None or self.kv_cache_config is None:
+            raise RuntimeError("必须先 initialize_kv_cache，再构建 Attention metadata")
+        if prepared.num_reqs <= 0 or prepared.num_tokens <= 0:
+            raise ValueError("空 batch 不需要 Attention metadata")
+
+        by_group: dict[int, FullAttentionMetadata] = {}
+        by_layer: dict[str, FullAttentionMetadata] = {}
+        query_lens_cpu = [
+            int(value)
+            for value in self.num_scheduled_tokens.np[: prepared.num_reqs]
+        ]
+        seq_lens_cpu = [
+            int(self.input_batch.num_computed_tokens_cpu[req_index])
+            + query_lens_cpu[req_index]
+            for req_index in range(prepared.num_reqs)
+        ]
+        max_query_len = max(query_lens_cpu)
+        max_seq_len = max(seq_lens_cpu)
+
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            spec = group.kv_cache_spec
+            if not isinstance(spec, FullAttentionSpec):
+                raise NotImplementedError(
+                    "当前 metadata 只实现 FullAttention，"
+                    f"收到 {type(spec).__name__}"
+                )
+
+            # InputBatch 保存 jagged Python block rows；Attention kernel 需要固定的
+            # GPU 二维页表，因此在这里整理为 [num_reqs, max_num_blocks]。
+            block_table_buffer = self.block_tables[group_id]
+            block_table_buffer.np.fill(0)  # block 0 是保留的 null block。
+            max_num_blocks = block_table_buffer.cpu.shape[1]
+            for req_index in range(prepared.num_reqs):
+                block_ids = self.input_batch.block_table[group_id][req_index]
+                required_blocks = (
+                    seq_lens_cpu[req_index] + spec.block_size - 1
+                ) // spec.block_size
+                if len(block_ids) < required_blocks:
+                    raise RuntimeError(
+                        "block table 无法覆盖 Attention 的 seq_len："
+                        f"group={group_id}, req={self.input_batch.req_ids[req_index]}, "
+                        f"required={required_blocks}, actual={len(block_ids)}"
+                    )
+                if len(block_ids) > max_num_blocks:
+                    raise RuntimeError("请求 block table 超过预分配容量")
+                if block_ids:
+                    block_table_buffer.np[req_index, : len(block_ids)] = block_ids
+            block_table_buffer.copy_to_gpu(prepared.num_reqs)
+
+            metadata = FullAttentionMetadata(
+                kv_cache_group_id=group_id,
+                layer_names=tuple(group.layer_names),
+                block_size=spec.block_size,
+                causal=True,
+                num_reqs=prepared.num_reqs,
+                num_actual_tokens=prepared.num_tokens,
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+                query_start_loc=prepared.query_start_loc,
+                seq_lens=prepared.seq_lens,
+                num_computed_tokens=self.num_computed_tokens[
+                    : prepared.num_reqs
+                ],
+                num_scheduled_tokens=self.num_scheduled_tokens.gpu[
+                    : prepared.num_reqs
+                ],
+                positions=prepared.positions,
+                block_table=block_table_buffer.gpu[: prepared.num_reqs],
+                slot_mapping=prepared.slot_mappings[group_id],
+            )
+            by_group[group_id] = metadata
+            for layer_name in group.layer_names:
+                if layer_name in by_layer:
+                    raise RuntimeError(f"Attention layer {layer_name} 属于多个 KV group")
+                by_layer[layer_name] = metadata
+
+        collection = FullAttentionMetadataCollection(
+            by_group=by_group,
+            by_layer=by_layer,
+        )
+        self.last_attention_metadata = collection
+        return collection
+
+    def _preprocess(
+        self,
+        prepared: PreparedInputBuffers,
+        attention_metadata: FullAttentionMetadataCollection,
+    ) -> ModelForwardInputs:
+        """选择纯文本模型路径，产出扁平化的真实前向输入。"""
+
+        if not bool(self.is_token_ids.gpu[: prepared.num_tokens].all().item()):
+            raise NotImplementedError("当前 _preprocess 尚未接入 prompt embeddings")
+
+        # 每个请求只需要最后一个 query hidden state 计算下一 token logits。
+        logits_indices = prepared.query_start_loc[1:].to(torch.int64) - 1
+        model_inputs = ModelForwardInputs(
+            input_ids=prepared.input_ids,
+            inputs_embeds=None,
+            positions=prepared.positions,
+            attention_metadata=attention_metadata,
+            logits_indices=logits_indices,
+        )
+        self.last_model_inputs = model_inputs
+        return model_inputs
+
     def _bookkeeping_after_sample(
         self,
         scheduler_output,
@@ -554,9 +698,13 @@ class GPUModelRunner:
         self._update_states(scheduler_output)
         assert self.input_batch is not None
         if scheduler_output.total_num_scheduled_tokens:
-            self._prepare_inputs(scheduler_output)
+            prepared = self._prepare_inputs(scheduler_output)
+            attention_metadata = self._build_attention_metadata(prepared)
+            self._preprocess(prepared, attention_metadata)
         else:
             self.last_prepared_inputs = None
+            self.last_attention_metadata = None
+            self.last_model_inputs = None
         req_ids = self.input_batch.req_ids
         sampled_token_ids: list[list[int]] = []
         for req_id in req_ids:
