@@ -72,22 +72,34 @@ class Qwen2Attention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
-        if self.head_dim * self.num_heads != config.hidden_size:
+        # 明确区分两个空间：hidden_size 是模型主干中每个 token 的维度；
+        # q_size 是全部 Q heads（以及全部 attention 输出 heads）拼接后的维度。
+        # Qwen2.5 中二者数值恰好相同，但语义并不相同。
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        if self.q_size != config.hidden_size:
             raise ValueError("hidden_size 必须能被 num_attention_heads 整除")
         if self.num_heads % self.num_kv_heads:
             raise ValueError("num_attention_heads 必须能被 num_key_value_heads 整除")
         self.rope_theta = config.rope_theta
         bias = config.attention_bias
         self.q_proj = nn.Linear(
-            config.hidden_size, self.num_heads * self.head_dim, bias=bias
+            # hidden_size, 是语义空间的维度，就是token向量的维度
+            config.hidden_size, self.q_size, bias=bias
         )
         self.k_proj = nn.Linear(
-            config.hidden_size, self.num_kv_heads * self.head_dim, bias=bias
+            config.hidden_size, self.kv_size, bias=bias
         )
         self.v_proj = nn.Linear(
-            config.hidden_size, self.num_kv_heads * self.head_dim, bias=bias
+            config.hidden_size, self.kv_size, bias=bias
         )
-        self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.o_proj = nn.Linear(
+            # 输入是所有 attention heads 的输出拼接空间，输出才回到
+            # token 的 hidden/residual 语义空间。
+            self.q_size,
+            config.hidden_size,
+            bias=False,
+        )
         # initialize_kv_cache 后由 runner 绑定，布局为
         # [num_blocks, 2(K/V), block_size, num_kv_heads, head_dim]。
         self.kv_cache: torch.Tensor | None = None
