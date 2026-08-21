@@ -135,34 +135,47 @@ if triton is not None:
 
     @triton.jit
     def _paged_varlen_flash_attention_v1_fwd_kernel(
-        q_ptr,
-        kv_cache_ptr,
-        block_table_ptr,
-        query_start_loc_ptr,
-        seq_lens_ptr,
-        out_ptr,
-        max_seq_len,
-        softmax_scale_log2,
+        q_ptr, # Q矩阵张量的起始地址
+        kv_cache_ptr, # 该layer的kvcache 张量的起始地址
+        block_table_ptr, # block_table张量的地址
+        query_start_loc_ptr, # req划分q向量的一维张量的地址
+        seq_lens_ptr, # 每个req序列长度的张量
+        out_ptr, # 输出张量的起始地址
+        max_seq_len, # 最长序列长度
+        softmax_scale_log2, # softmax 缩放因子
+
+        # Q矩阵[q_i, q_head, head_dim]，各个轴的步进元素个数
         stride_qm: tl.constexpr,
         stride_qh: tl.constexpr,
         stride_qd: tl.constexpr,
+
+        # kvcache tensor [num_blocks, 2, block_size, kv_heads, head_dim]，各个轴的步进
         stride_cache_block: tl.constexpr,
         stride_cache_kv: tl.constexpr,
         stride_cache_token: tl.constexpr,
         stride_cache_head: tl.constexpr,
         stride_cache_d: tl.constexpr,
+
+        # block table 的[num_reqs, max_blocks_per_req]，各个轴的步进
         stride_bt_req: tl.constexpr,
         stride_bt_block: tl.constexpr,
-        stride_om: tl.constexpr,
+
+        # O矩阵[q_i, q_head, head_dim]，各个轴的步进元素个数
+        stride_om: tl.constexpr, 
         stride_oh: tl.constexpr,
         stride_od: tl.constexpr,
-        HEAD_DIM: tl.constexpr,
-        BLOCK_D: tl.constexpr,
-        BLOCK_SIZE: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        Q_HEADS_PER_KV_HEAD: tl.constexpr,
-        IS_CAUSAL: tl.constexpr,
+
+
+        HEAD_DIM: tl.constexpr,# head_dim
+        BLOCK_D: tl.constexpr, # 同head_dim, 必须是2的指数倍
+        BLOCK_SIZE: tl.constexpr, # 每个block的token数
+        BLOCK_M: tl.constexpr, # 每个program可以处理同req的32个q向量
+        BLOCK_N: tl.constexpr, # 每个program每次循环处理 32个k 向量
+        Q_HEADS_PER_KV_HEAD: tl.constexpr, # gqa, 多少个q头 共用一个kv头
+        IS_CAUSAL: tl.constexpr
+        '''
+            num_warps, num_stages 是triton的保留关键字， 由launch机制识别和拦截
+        '''
     ):
         """分页 KV + 变长 batch 的 online-softmax 主循环。
 
@@ -170,88 +183,192 @@ if triton is not None:
         负责一个 request 的一个 Q head，因而不同请求之间天然隔离。
         """
 
+
+
+        # 当前program， 确认自己在grid中领到的各自的任务：
+        # 0. 处理这个req的第几个Q_tile
+        # 1. 处理第几个q头
+        # 2. 处理第几个req
         query_block = tl.program_id(0)
         query_head = tl.program_id(1)
         request_id = tl.program_id(2)
 
         # 【变长Batch优化】每个 program 通过 query_start_loc 找到自己请求在
         # 扁平 Q 中的边界。矩形 grid 中超过真实 query_len 的 tile 全程 mask。
-        request_q_start = tl.load(query_start_loc_ptr + request_id)
+
+        # 加载出当前req的起始token索引
+        request_q_start = tl.load(query_start_loc_ptr + request_id) 
+
+        # 加载出当前req的结束token的索引，也就是下一个req的起始索引
         request_q_end = tl.load(query_start_loc_ptr + request_id + 1)
+
+        '''
+        [request_q_start, request_q_end)
+        '''
+
+        # 计算出当前program实际需要计算的这个req的query有多少个向量
         query_len = request_q_end - request_q_start
+
+        # 计算一下自己算这个query的哪一部分Q_tile，得到query_len里面的起点
         tile_q_start = query_block * BLOCK_M
+
+        #提取这个req的整个序列长度
         seq_len = tl.load(seq_lens_ptr + request_id)
-        context_len = seq_len - query_len
+        context_len = seq_len - query_len #算一下这个req的kv上下文长度
+
+        #获取本次要计算的q向量的索引张量[xx, xx+1, xx+2, xx+3,...xx+BLOCK_M-1](在这个seq的query内部的索引)
         local_q_pos = tile_q_start + tl.arange(0, BLOCK_M)
+
+        #得到本次要计算的q向量的索引张量，在整个batch的Q矩阵里面的索引，也就是全局索引
         flat_q_pos = request_q_start + local_q_pos
+
+        #算出每个q的head_dim的各自的元素的q内索引张量
         offs_d = tl.arange(0, BLOCK_D)
+
+        #加载掩码，保证加载Q_tile的时候，不会超出真实的Q，用来处理边界情况
         q_mask = (local_q_pos[:, None] < query_len) & (
             offs_d[None, :] < HEAD_DIM
         )
+
+        # 开始加载出Q_tile
         q = tl.load(
             q_ptr
             + flat_q_pos[:, None] * stride_qm
             + query_head * stride_qh
             + offs_d[None, :] * stride_qd,
             mask=q_mask,
-            other=0.0,
+            other=0.0, #表示被mask掉的元素填什么值
         )
+
+
+        #__________________________________________________________________________
 
         # 【GQA优化】Qwen2.5 的 cache 只保存真实 KV heads。多个 Q heads 通过
         # 整数映射直接共享一个 KV head，不再 repeat_interleave 复制 KV 张量。
+
+
+        # 通过当前program负责的q头id，看看我们用哪个kv头号
         kv_head = query_head // Q_HEADS_PER_KV_HEAD
-        offs_n = tl.arange(0, BLOCK_N)
+        offs_n = tl.arange(0, BLOCK_N) #先定义加载一个kv头的向量内部元素的相对索引
+
+        # 先创建好缓冲区，m,用来保存每个q in Q_tile 的 max(xi)
+        # l用来保存每个q下计算出的分母的局部和
         m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
         l_i = tl.zeros((BLOCK_M,), tl.float32)
+
+        # acc是用来累加未归一化的O_i的计算结果的，等循环结束后，统一用最新的l来归一化，然后写入O_i
         acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
 
+
+
+
+
+        '''
+        query: 所有请求拼接后的 ``[total_query_tokens, q_heads, head_dim]``。
+
+        kv_cache: ``[num_blocks, 2, block_size, kv_heads, head_dim]``。
+
+        block_table: ``[num_reqs, max_blocks_per_req]`` 物理页表。
+
+        query_start_loc: 请求在扁平 query 中的前缀和边界。
+
+        seq_lens: 写入本轮 K/V 后各请求的完整序列长度。
+        '''
+
+
+
+        # 开始我们的外层循环，每次执行block_n个kv向量头
         for start_n in range(0, max_seq_len, BLOCK_N):
+            # 计算当前block_n个kv向量头的各个k向量，在kv上下文中的索引
             key_pos = start_n + offs_n
             key_valid = key_pos < seq_len
+
+            # 计算当前block_n个kv向量头，各自属于是req内的block索引
             logical_block = key_pos // BLOCK_SIZE
+            # 以及各个kv向量头，在block内的偏移索引
             block_offset = key_pos % BLOCK_SIZE
+
+
 
             # 【PagedAttention优化】页表翻译被合并进 attention kernel：不再
             # gather 连续历史 KV。每个 key token 在使用时才解析物理 block。
             physical_block = tl.load(
-                block_table_ptr
-                + request_id * stride_bt_req
-                + logical_block * stride_bt_block,
+                block_table_ptr # block_table的地址
+                + request_id * stride_bt_req # 1. 先偏移到对应的req
+                + logical_block * stride_bt_block, # 2. 各个kv头的block对应的地址列表
                 mask=key_valid,
                 other=0,
             )
+
+
+
+
+
+
+            # block_n x block_d, 表示的是这个program需要用到的K_tile的内存空间
 
             # 【Decode 2D向量化加载优化】一次构造 BLOCK_N x BLOCK_D 地址矩阵，
             # 沿 token/head_dim 两维加载一个分页 K/V tile。K 用 [D,N] 供 q@k，
             # V 用 [N,D] 供 p@v；数据直接进入本 program 的片上工作集。
             k_mask = (offs_d[:, None] < HEAD_DIM) & key_valid[None, :]
+
+            # k就是用2D向量方式，给load一个地址的2维张量，让他直接加载各自的元素即可。
             k = tl.load(
-                kv_cache_ptr
-                + physical_block[None, :] * stride_cache_block
-                + block_offset[None, :] * stride_cache_token
-                + kv_head * stride_cache_head
-                + offs_d[:, None] * stride_cache_d,
+                kv_cache_ptr # kvcache tensor的起始地址
+                + physical_block[None, :] * stride_cache_block # 加上得到 这些k头的各个物理块的起始地址
+                + block_offset[None, :] * stride_cache_token # 加上各个k头在block内的各自的偏移
+                + kv_head * stride_cache_head # 加上所在头的偏移量
+                + offs_d[:, None] * stride_cache_d, #每个k头的地址开始，各自包括一个头的长度，因此加载出来是2D张量
                 mask=k_mask,
                 other=0.0,
             )
+
+
+            # 先算出每一轮的局部打分
             scores = tl.dot(q, k) * softmax_scale_log2
+
+            # [BLOCK_M(Q_tile中q数数), BLOCK_N(K_tile中k数)]
+            # valid[i, j] 回答q_i 能不能attend k_tile中的第j个k_j
+            '''
+            这里的valid, 是实现数据有效性，屏蔽掉边界不足block_m的q(padding), 和不足block_n的k(padding)
+            就是说，这个（block_m, block_n）的score，有哪些是有效的，不是算到padding上去了
+            '''
             valid = (local_q_pos[:, None] < query_len) & key_valid[None, :]
+
+
+            # 如果我们是因果的，所以valid还需要再加上因果掩码
             if IS_CAUSAL:
                 # 【Prefill因果掩码】chunked prefill 的第一个 Q 对应 context_len；
                 # decode 时 query_len=1，它自然可以看到 seq_len 内全部 KV。
-                valid &= key_pos[None, :] <= (
+                valid &= key_pos[None, :] <= ( # 这里就是保证valid一定是下三角
                     context_len + local_q_pos[:, None]
                 )
+
+            # 开始掩码生效，产生正确的score的局部打分
             scores = tl.where(valid, scores, -float("inf"))
 
+
+
+            '''
+                        k0   k1   k2   ... k31          axis=1 求 max
+                q0   [  s00  s01  s02  ... s0,31 ]  →  max_j(s0j)   ┐
+                q1   [  s10  s11  s12  ... s1,31 ]  →  max_j(s1j)   ├─→ 结果形状 [BLOCK_M]
+                ...                                                      （每个 q 一个值）
+                q31  [ s310  s311 ...          ]  →  max_j(s31j)  ┘
+            '''
+            # score=(block_m, block_n)， axis=1,表示把k向量维度消掉，就看q向量维度
             block_max = tl.max(scores, axis=1)
-            m_new = tl.maximum(m_i, block_max)
-            alpha = tl.exp2(m_i - m_new)
-            probabilities = tl.exp2(scores - m_new[:, None])
-            l_new = l_i * alpha + tl.sum(probabilities, axis=1)
+            m_new = tl.maximum(m_i, block_max) # 更新最大值m_i
+
+            alpha = tl.exp2(m_i - m_new) #算一下更新系数
+
+            probabilities = tl.exp2(scores - m_new[:, None]) # 算一下本k_tile的局部分母
+            l_new = l_i * alpha + tl.sum(probabilities, axis=1) # 更新旧分母，加上本次的分母
+
+
 
             v_mask = key_valid[:, None] & (offs_d[None, :] < HEAD_DIM)
-            v = tl.load(
+            v = tl.load( # 向量化直接加载V_tile
                 kv_cache_ptr
                 + physical_block[:, None] * stride_cache_block
                 + stride_cache_kv
@@ -261,15 +378,23 @@ if triton is not None:
                 mask=v_mask,
                 other=0.0,
             )
+
+            # 计算未归一化的累加缓冲区，也就是O_tile
             acc = acc * alpha[:, None] + tl.dot(probabilities.to(v.dtype), v)
             m_i = m_new
             l_i = l_new
 
+
+        # 最终归一化
         output = acc / l_i[:, None]
+
+        
         out_mask = (local_q_pos[:, None] < query_len) & (
             offs_d[None, :] < HEAD_DIM
         )
-        tl.store(
+
+        # 向量化写入 O_tile
+        tl.store( 
             out_ptr
             + flat_q_pos[:, None] * stride_om
             + query_head * stride_oh
@@ -277,6 +402,16 @@ if triton is not None:
             output,
             mask=out_mask,
         )
+
+
+
+
+
+
+
+
+
+
 
 
 def _torch_attention(
@@ -423,18 +558,23 @@ def paged_varlen_flash_attention_v1(
     seq_lens: torch.Tensor,
     *,
     block_size: int,
-    max_query_len: int,
-    max_seq_len: int,
+    max_query_len: int, # batch里最长的query数
+    max_seq_len: int, # batch里req, 最长的完成序列kvcache长度
     causal: bool = True,
 ) -> torch.Tensor:
     """直接从分页 KV cache 计算扁平变长 batch 的 FlashAttention。
 
     Args:
         query: 所有请求拼接后的 ``[total_query_tokens, q_heads, head_dim]``。
+
         kv_cache: ``[num_blocks, 2, block_size, kv_heads, head_dim]``。
+
         block_table: ``[num_reqs, max_blocks_per_req]`` 物理页表。
+
         query_start_loc: 请求在扁平 query 中的前缀和边界。
+
         seq_lens: 写入本轮 K/V 后各请求的完整序列长度。
+    
 
     该接口一次 kernel launch 覆盖整个变长 batch。它没有外部 KV gather；
     GQA 通过 head 索引映射共享真实 KV heads，不会把 4 个 KV heads 复制成
@@ -487,37 +627,96 @@ def paged_varlen_flash_attention_v1(
             causal=causal,
         )
 
-    query = query.contiguous()
-    output = torch.empty_like(query)
-    block_d = triton.next_power_of_2(head_dim)
-    block_m = 32
-    block_n = 32
+    query = query.contiguous() # 确保这个张量的底层内存是连续的
+    output = torch.empty_like(query) # 每个注意力输出向量，都和q是一样的形状，所以和输入的Q矩阵也是一样的输出形状
+
+    # triton kernel启动前的 分块tiling + 网格配置
+    # 觉得把整个注意力计算切成多少个小块，每个小块交给那个GPU program 去算
+
+
+    '''
+    这边是定义一个program(block) 处理数据的规模spec
+    '''
+    # 一个block负责计算一个head，且必须是2的指数倍，所以对head_dim取2 power
+    block_d = triton.next_power_of_2(head_dim) # q向量维度的切分，我们是以一个head来切分的，这里要求了head_dim必须是2的指数倍
+    block_m = 32 # Q分块的大小，一个block负责计算32个q向量
+    block_n = 32 # 一个block负责计算32个kv向量
+
+
+    '''
+    根据一个program的spec, 我们开始计算实需要多少个program， grid 就是 program的布局
+    '''
     grid = (
-        triton.cdiv(max_query_len, block_m),
-        query.shape[1],
-        seq_lens.numel(),
+        triton.cdiv(max_query_len, block_m), # 每block_m个q都需要一个program，每个req都有max_query_len个q，所以需要xxx个program
+        query.shape[1], # 每个Q head必须有一个program，所以这个维度算出来的program所需的个数
+        seq_lens.numel(),  # 每个req都需要单独一个program, 所以必须有req个数个program
     )
+
+
     _paged_varlen_flash_attention_v1_fwd_kernel[grid](
-        query,
-        kv_cache,
-        block_table,
-        query_start_loc,
-        seq_lens,
-        output,
-        max_seq_len,
-        1.0 / math.sqrt(head_dim) * math.log2(math.e),
-        *query.stride(),
-        *kv_cache.stride(),
-        *block_table.stride(),
-        *output.stride(),
+        query, # 整个batch的输入Q矩阵
+        kv_cache, # 这一层的kvcache tensor
+        block_table, # 整个batch的每个req对应的kv向量的block id列表
+        query_start_loc, # 划分Q矩阵 req分布
+        seq_lens, # 这个batch的各个req的完整序列长度的张量
+        output, # 输出矩阵，和Q矩阵相同形状
+        max_seq_len, # batch的req中，拥有的最长历史kv向量个数的个数，决定了flashattention要循环更新多少次
+        '''
+        attention = softmax( QK^T / √d )
+            softmax的缩放因子 根号dk, 但是这里还乘了一个log2(e), 原因是kernel里面的softmax是2为底，不是e为底，所以
+            要多乘一个系数，把他换尺度
+        '''
+        1.0 / math.sqrt(head_dim) * math.log2(math.e), 
+
+        '''
+            torch.Tensor.stride() 返回的是这个tensor的stride元组。 *把元组解包乘多个独立位置参数
+            stride就是算按某个轴移动下一个元素，底层内存需要步进多少个元素。他返回的是一个元组，每个轴下的步进距离。
+
+            这里为什么要传递stride给triton kernel?
+
+            因为triton kernel 收到的tensor会被转成裸指针 q_ptr, 他不知道tensor的形状和内存布局。所以kernel要自己
+            算每个元素的地址。
+
+
+        '''
+        *query.stride(), # Q矩阵[q_i, q_head, head_dim], 每个轴的步进距离元组
+        *kv_cache.stride(), # 该layer的kvcache 张量[num_blocks, 2, block_size, kv_heads, head_dim] 每个轴的步进距离元组
+        *block_table.stride(), # [num_reqs, max_blocks_per_req]
+        *output.stride(), # 同Q
         HEAD_DIM=head_dim,
-        BLOCK_D=block_d,
-        BLOCK_SIZE=block_size,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        Q_HEADS_PER_KV_HEAD=query.shape[1] // kv_cache.shape[3],
-        IS_CAUSAL=causal,
-        num_warps=4,
+        BLOCK_D=block_d, # 同head_dim, 必须是2的指数倍
+        BLOCK_SIZE=block_size, # 一个block里面16个token
+        BLOCK_M=block_m, # Q矩阵的q向量切分，一个program负责处理32个q向量
+        BLOCK_N=block_n,  # kv矩阵切分，一个program负责处理32个kv向量
+        Q_HEADS_PER_KV_HEAD=query.shape[1] // kv_cache.shape[3], # GQA的分组 q_head // kv_heads, 表示多少个q头共享一个kv头
+        
+        '''
+            这里有一点小细节，我们triton的算子实现的形参里面，会用constexpr来标记是编译器变量
+            IS_CAUSAL: tl.constexpr 所以里面会有如下， 类似条件编译
+                if IS_CAUSAL:
+                    valid &= xxx  
+        '''
+        IS_CAUSAL=causal, # 因果，kernel本身是通用的，不会写死因果，比如可能会有双向注意力
+        num_warps=4, # 每个program内部规定4 个warp
+
+        '''
+            num_warps 是 每个program里有多少个warp线程并行
+            num_stages 是 软件流水线（software pipelining）的深度, 本质是预取优化
+
+            我们的kernel里面，主循环是block_n个kv向量的循环，每次加载一个k tile
+            然后做计算，这个计算依赖k tile。
+
+            从全局内存加载数据有几百个时钟周期的延迟。
+            如果串行执行「加载→计算→加载→计算」，GPU 会有一半时间在空等内存。
+
+            num_stages = 2 表示 2 级流水线（也就是 double-buffering 双缓冲）：
+            编译器会在算第 i 块的矩阵乘时，提前把第 i+1 块的 K/V tile 预取到共享内存。这样：
+
+            计算和加载重叠，把内存延迟「藏」在计算下面。
+            num_stages = 2 就是「提前预取 1 块」；num_stages = 3 就是提前预取 2 块，流水线更深
+-----------------------------------------------------------
+            num_stages=2 是软件流水线深度（双缓冲预取）
+        '''
         num_stages=2,
     )
     return output

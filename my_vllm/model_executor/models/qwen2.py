@@ -153,7 +153,11 @@ class Qwen2Attention(nn.Module):
         v = self.v_proj(hidden_states).view(
             num_tokens, self.num_kv_heads, self.head_dim
         )
+
+        # 给batch的输入token向量对应的 q向量 + k向量，增加位置编码
         q, k = self._apply_rope(q, k, positions)
+
+
         if attention_metadata is None:
             repeats = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(repeats, dim=1)
@@ -189,11 +193,23 @@ class Qwen2Attention(nn.Module):
         else:
             if attention_metadata.num_actual_tokens != num_tokens:
                 raise ValueError("metadata token 数与 hidden_states 不一致")
+
+
+            # 把我们输入token向量的k,v向量，全部写入我们的kvcache tensor
             self._write_to_kv_cache(k, v, attention_metadata.slot_mapping)
+
+            '''
+            所以，一次flashattention的算子调用，其实是一口气批量处理整个batch的q向量
+            这个算子，其实就是内核的wrapper
+
+            所以，层 包含如何调用算子， 算子 = 核函数的wrapper
+            '''
             output = paged_varlen_flash_attention_v1(
-                q,
-                self.kv_cache,
-                attention_metadata.block_table,
+                q, # 一个batch的所有token的q向量， shape = (num_tokens, self.num_heads, self.head_dim)
+                self.kv_cache, # 这个layer的kvcache显存张量，也就是我们的物理显存
+
+                # 注意力元数据，包含block_table, 位置索引
+                attention_metadata.block_table, # 块 页表
                 attention_metadata.query_start_loc,
                 attention_metadata.seq_lens,
                 block_size=attention_metadata.block_size,
