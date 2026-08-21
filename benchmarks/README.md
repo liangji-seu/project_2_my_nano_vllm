@@ -1,4 +1,4 @@
-# Qwen2.5-7B Baseline Benchmark
+# Qwen2.5-7B 可复现性能实验
 
 固定工作负载：256个请求，每条请求的在线服务实际输入为1024 tokens，服务端
 `max_model_len=4096`。默认每条生成128 tokens并忽略EOS，避免模型提前停止导致
@@ -40,3 +40,13 @@ python benchmarks/benchmark_online_serving.py \
 
 用于后续自动汇总和版本对比的完整实验配置见：
 `benchmarks/results/qwen2_5_7b_baseline_256req_c16_manifest.json`。
+
+融合PagedAttention、变长Batch、Decode二维分页KV加载与原生GQA后的正式结果见：
+
+- `benchmarks/results/qwen2_5_7b_optim_flashattention_256req_c16.md`
+- `benchmarks/results/qwen2_5_7b_optim_flashattention_256req_c16_manifest.json`
+- `benchmarks/results/qwen2_5_7b_baseline_vs_optim_flashattention.md`
+
+优化实验继续使用完全相同的请求文件与服务参数。实测总Token Throughput由
+1,613.898 tok/s提升到3,231.884 tok/s（+100.25%），平均TPOT由87.30 ms
+降到42.33 ms（-51.51%）；该版本尚未启用CUDA Graph。
