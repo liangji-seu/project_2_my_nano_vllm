@@ -29,6 +29,58 @@
 | KV blocks | 4097（含1个null block，可用4096个） |
 | Prefix Cache | 关闭，避免跨请求重复前缀影响结果 |
 
+### 2.1 模型结构
+
+| 参数 | 数值 |
+|---|---:|
+| Architecture | `Qwen2ForCausalLM` |
+| DType | BF16 |
+| Decoder Layers | 28 |
+| Hidden Size | 3584 |
+| Intermediate Size | 18,944 |
+| Q Heads | 28 |
+| KV Heads | 4 |
+| Head Dim | 128 |
+| RoPE Theta | 10,000,000 |
+| 模型配置最大位置 | 1,010,000 |
+
+### 2.2 调度与执行参数
+
+`max_num_batched_tokens=2048`就是Scheduler每一轮的全局Token Budget。Scheduler
+按FCFS遍历RUNNING和WAITING请求，将每个请求的
+`num_tokens - num_computed_tokens`截断到剩余Token Budget，因此同一套调度逻辑
+统一覆盖Chunked Prefill和Decode。
+
+```text
+单轮Token Budget       = 2048
+最大持久化请求槽位      = 16
+最大上下文              = 4096
+KV block size          = 16 tokens
+物理blocks             = 4097（1 null + 4096 usable）
+最大可寻址KV token槽位  = 4096 × 16 = 65,536
+调度模式                = 同步SchedulerOutput → execute_model → 等待结果
+```
+
+本次执行算法能力为Continuous Batching + Chunked Prefill；没有CUDA Graph、TP、
+PP或投机解码。
+
+### 2.3 Baseline Attention边界
+
+```text
+slot_mapping写当前K/V
+        ↓
+Python按request循环
+        ↓
+block_table gather完整历史KV为连续张量
+        ↓
+repeat_interleave：4个KV heads复制为28个heads
+        ↓
+教学版Triton FlashAttention（online softmax）
+```
+
+因此这是“框架Baseline + gather-based Attention”，不是已经融合PagedAttention、
+变长Batch和原生GQA的优化版本。
+
 ## 3. 固定工作负载
 
 请求文件：
@@ -56,6 +108,32 @@ block，超过这张单卡容量。因此这里采用256个总请求、16个并�
 
 ### 4.1 启动Profiling拆分
 
+`profile_run()`使用2048个dummy tokens，即：
+
+```text
+profile_tokens = min(max_num_batched_tokens=2048,
+                     max_model_len=4096,
+                     model_config_max_position=1,010,000)
+               = 2048
+
+sampled_logit_positions = min(max_num_seqs=16, profile_tokens=2048)
+                         = 16
+```
+
+显存预算公式为：
+
+```text
+requested_memory = total_memory × gpu_memory_utilization
+available_kv     = requested_memory
+                   - used_after_model_load
+                   - activation_peak
+
+                 = 45,769,457,664
+                   - 16,170,745,856
+                   - 286,425,088
+                 = 29,312,286,720 bytes
+```
+
 | 指标 | 字节 | GiB |
 |---|---:|---:|
 | GPU总显存 | 50,854,952,960 | 47.362 |
@@ -67,6 +145,22 @@ block，超过这张单卡容量。因此这里采用256个总请求、16个并�
 | 本次实际分配KV Cache | 3,759,013,888 | 3.501 |
 | KV初始化后PyTorch allocated | 19,045,016,576 | 17.737 |
 | KV初始化后PyTorch reserved | 19,258,146,816 | 17.936 |
+
+Qwen2.5-7B每个token的KV理论开销：
+
+```text
+单层、单token KV = 2(K/V) × 4 KV heads × 128 head_dim × 2 bytes(BF16)
+                 = 2,048 bytes
+
+28层、单token KV = 2,048 × 28 = 57,344 bytes = 56 KiB
+
+全模型、单block KV = 57,344 × 16 = 917,504 bytes = 896 KiB
+
+本次KV分配 = 917,504 × 4097 = 3,759,013,888 bytes
+```
+
+如果使用自动预算，理论上会得到31,947 blocks；本次手工限制为4097 blocks，
+用于给旧Attention的gather、GQA复制及其他运行时临时张量保留显存。
 
 本次没有使用自动算出的27.299 GiB KV预算，而是按压测最大并发容量显式分配
 4097 blocks。原因是Baseline会在运行时额外gather历史KV并把GQA KV heads复制
@@ -143,3 +237,17 @@ python benchmarks/benchmark_online_serving.py \
 ```
 
 原始逐请求指标和全部GPU采样点保存在同名JSON文件中。
+
+## 8. 实验资产与版本
+
+| 资产 | 路径/版本 |
+|---|---|
+| Baseline算法起点 | `04b8051` |
+| 正式压测运行代码 | `3513ca0` |
+| 固定请求文件 | `benchmarks/workloads/qwen2_5_7b_256req_1024prompt_128output.jsonl` |
+| 原始逐请求结果 | `benchmarks/results/qwen2_5_7b_baseline_256req_c16.json` |
+| 机器可读实验清单 | `benchmarks/results/qwen2_5_7b_baseline_256req_c16_manifest.json` |
+
+后续实验必须至少保持模型、请求文件SHA-256、Prompt/Output长度、并发窗口、
+`max_model_len`、Token Budget、KV block数量、Prefix Cache开关和采样口径一致。
+若某项配置因优化方案必须变化，需要在新报告中单独说明，不能直接比较吞吐数字。

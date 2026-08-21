@@ -38,3 +38,6 @@ python benchmarks/benchmark_online_serving.py \
 
 当前Baseline实测报告见：
 `benchmarks/results/qwen2_5_7b_baseline_256req_c16.md`。
+
+用于后续自动汇总和版本对比的完整实验配置见：
+`benchmarks/results/qwen2_5_7b_baseline_256req_c16_manifest.json`。
