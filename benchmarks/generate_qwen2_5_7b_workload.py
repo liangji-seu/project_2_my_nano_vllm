@@ -43,6 +43,18 @@ def _make_exact_prompt(
             ).ids
         )
 
+    # 大段填充用二分搜索，避免对逐渐增长的千Token字符串做上千次重编码。
+    unit = " benchmark"
+    low, high = 0, target_tokens
+    while low < high:
+        middle = (low + high + 1) // 2
+        if count(content + unit * middle) <= target_tokens:
+            low = middle
+        else:
+            high = middle - 1
+    content += unit * low
+
+    # BPE边界可能让最后还差少量token，再用多种短片段精确补齐。
     while count(content) < target_tokens:
         current = count(content)
         best: str | None = None
