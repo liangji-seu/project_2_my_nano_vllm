@@ -58,6 +58,10 @@ class EngineCore:
         # Worker 先根据真实模型给出 spec 并 profiling；EngineCore 据此生成唯一的
         # KVCacheConfig，再同时交给 GPU 物理张量和 CPU BlockPool 使用。
         self.kv_cache_config = self._initialize_kv_caches()
+        self.memory_profiles = self.model_executor.collective_rpc(
+            "get_memory_profile"
+        )
+        logger.info("BENCHMARK_MEMORY_PROFILE %s", self.memory_profiles)
 
         from my_vllm.v1.core.kv_cache_manager import KVCacheManager
 
