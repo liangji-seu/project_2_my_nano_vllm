@@ -19,6 +19,7 @@ AsyncLLM 是 API 层和引擎后端之间的桥梁:
 
 import asyncio
 import logging
+from typing import Any
 
 from my_vllm.config import EngineConfig
 from my_vllm.engine.core_client import MPClient
@@ -116,7 +117,11 @@ class AsyncLLM:
         prompt: str,
         max_tokens: int = 100,
         temperature: float = 0.0,
-    ) -> str:
+        *,
+        return_metrics: bool = False,
+        request_start_ns: int | None = None,
+        ignore_eos: bool = False,
+    ) -> str | dict[str, Any]:
         """通过 ZMQ 发送推理请求到引擎后端, 等待返回结果
 
         对应 vLLM AsyncLLM.generate()
@@ -145,8 +150,15 @@ class AsyncLLM:
         )
 
         # 通过 ZMQ 发送到引擎后端, 等待返回
-        result = await self.mp_client.generate(prompt, max_tokens=max_tokens)
-        logger.info("推理完成: result=%.50s...", result)
+        result = await self.mp_client.generate(
+            prompt,
+            max_tokens=max_tokens,
+            return_metrics=return_metrics,
+            request_start_ns=request_start_ns,
+            ignore_eos=ignore_eos,
+        )
+        result_text = result["text"] if isinstance(result, dict) else result
+        logger.info("推理完成: result=%.50s...", result_text)
         return result
 
     # ---- 关闭 ----
