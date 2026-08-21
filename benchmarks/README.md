@@ -35,3 +35,8 @@ python benchmarks/benchmark_online_serving.py \
 `TTFT` 从FastAPI收到请求开始，到EngineCore取得第一个采样token结束；`TPOT`
 为首token之后的生成耗时除以剩余输出token数。HTTP接口仍是非流式，因此不能
 用客户端收到响应的时间代替TTFT。
+当前Baseline实测报告见：
+`benchmarks/results/qwen2_5_7b_baseline_256req_c16.md`。
+
+用于后续自动汇总和版本对比的完整实验配置见：
+`benchmarks/results/qwen2_5_7b_baseline_256req_c16_manifest.json`。
