@@ -172,10 +172,9 @@ if triton is not None:
         BLOCK_M: tl.constexpr, # 每个program可以处理同req的32个q向量
         BLOCK_N: tl.constexpr, # 每个program每次循环处理 32个k 向量
         Q_HEADS_PER_KV_HEAD: tl.constexpr, # gqa, 多少个q头 共用一个kv头
-        IS_CAUSAL: tl.constexpr
-        '''
-            num_warps, num_stages 是triton的保留关键字， 由launch机制识别和拦截
-        '''
+        IS_CAUSAL: tl.constexpr,
+        # num_warps、num_stages 是 Triton launch 的保留关键字，由launch机制
+        # 识别和拦截，不作为kernel的显式形参。
     ):
         """分页 KV + 变长 batch 的 online-softmax 主循环。
 
@@ -661,24 +660,13 @@ def paged_varlen_flash_attention_v1(
         seq_lens, # 这个batch的各个req的完整序列长度的张量
         output, # 输出矩阵，和Q矩阵相同形状
         max_seq_len, # batch的req中，拥有的最长历史kv向量个数的个数，决定了flashattention要循环更新多少次
-        '''
-        attention = softmax( QK^T / √d )
-            softmax的缩放因子 根号dk, 但是这里还乘了一个log2(e), 原因是kernel里面的softmax是2为底，不是e为底，所以
-            要多乘一个系数，把他换尺度
-        '''
+        # attention = softmax(QK^T / √d)。这里除了1/√d还乘log2(e)，
+        # 因为kernel内使用exp2，需要把以e为底的指数换到以2为底的尺度。
         1.0 / math.sqrt(head_dim) * math.log2(math.e), 
 
-        '''
-            torch.Tensor.stride() 返回的是这个tensor的stride元组。 *把元组解包乘多个独立位置参数
-            stride就是算按某个轴移动下一个元素，底层内存需要步进多少个元素。他返回的是一个元组，每个轴下的步进距离。
-
-            这里为什么要传递stride给triton kernel?
-
-            因为triton kernel 收到的tensor会被转成裸指针 q_ptr, 他不知道tensor的形状和内存布局。所以kernel要自己
-            算每个元素的地址。
-
-
-        '''
+        # torch.Tensor.stride()返回各轴移动一个元素所需的底层步进，*将元组
+        # 解包成多个位置参数。Triton kernel收到的是裸指针，不知道Tensor的
+        # 形状与内存布局，因此必须依靠这些stride自行计算元素地址。
         *query.stride(), # Q矩阵[q_i, q_head, head_dim], 每个轴的步进距离元组
         *kv_cache.stride(), # 该layer的kvcache 张量[num_blocks, 2, block_size, kv_heads, head_dim] 每个轴的步进距离元组
         *block_table.stride(), # [num_reqs, max_blocks_per_req]
@@ -690,33 +678,14 @@ def paged_varlen_flash_attention_v1(
         BLOCK_N=block_n,  # kv矩阵切分，一个program负责处理32个kv向量
         Q_HEADS_PER_KV_HEAD=query.shape[1] // kv_cache.shape[3], # GQA的分组 q_head // kv_heads, 表示多少个q头共享一个kv头
         
-        '''
-            这里有一点小细节，我们triton的算子实现的形参里面，会用constexpr来标记是编译器变量
-            IS_CAUSAL: tl.constexpr 所以里面会有如下， 类似条件编译
-                if IS_CAUSAL:
-                    valid &= xxx  
-        '''
+        # IS_CAUSAL在kernel形参中由tl.constexpr标记，是编译期常量；因此
+        # kernel内部的if IS_CAUSAL类似条件编译，不需要运行时分支。
         IS_CAUSAL=causal, # 因果，kernel本身是通用的，不会写死因果，比如可能会有双向注意力
         num_warps=4, # 每个program内部规定4 个warp
 
-        '''
-            num_warps 是 每个program里有多少个warp线程并行
-            num_stages 是 软件流水线（software pipelining）的深度, 本质是预取优化
-
-            我们的kernel里面，主循环是block_n个kv向量的循环，每次加载一个k tile
-            然后做计算，这个计算依赖k tile。
-
-            从全局内存加载数据有几百个时钟周期的延迟。
-            如果串行执行「加载→计算→加载→计算」，GPU 会有一半时间在空等内存。
-
-            num_stages = 2 表示 2 级流水线（也就是 double-buffering 双缓冲）：
-            编译器会在算第 i 块的矩阵乘时，提前把第 i+1 块的 K/V tile 预取到共享内存。这样：
-
-            计算和加载重叠，把内存延迟「藏」在计算下面。
-            num_stages = 2 就是「提前预取 1 块」；num_stages = 3 就是提前预取 2 块，流水线更深
------------------------------------------------------------
-            num_stages=2 是软件流水线深度（双缓冲预取）
-        '''
+        # num_warps是每个program内并行的warp数量。num_stages是软件流水线
+        # 深度：2表示双缓冲，计算第i个K/V tile时预取第i+1个tile，使加载与
+        # 计算重叠；更大的值会增加预取深度，也会占用更多片上资源。
         num_stages=2,
     )
     return output
