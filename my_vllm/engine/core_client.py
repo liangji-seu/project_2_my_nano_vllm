@@ -18,7 +18,7 @@ import multiprocessing
 import tempfile
 import uuid
 import weakref
-from typing import Iterator
+from typing import Any, Iterator
 
 import zmq
 import zmq.asyncio  # noqa: F401 — 必须显式导入才能使用 zmq.asyncio.Context
@@ -242,7 +242,11 @@ class MPClient:
         # _pending_requests: request_id → Future
         # generate() 发送请求后创建一个 Future,
         # _process_outputs() 收到输出后 resolve
-        self._pending_requests: dict[str, asyncio.Future[str]] = {}
+        # request_id -> (Future, 是否需要返回引擎内部性能指标)。普通在线请求
+        # 仍只得到文本；benchmark 请求得到完整 output 字典。
+        self._pending_requests: dict[
+            str, tuple[asyncio.Future[Any], bool]
+        ] = {}
 
         # ---- 状态 ----
         self._started = False
@@ -306,9 +310,14 @@ class MPClient:
                 request_id = output.get("request_id", "")
                 logger.debug("收到引擎输出: request_id=%s", request_id)
 
-                future = self._pending_requests.pop(request_id, None)
+                pending = self._pending_requests.pop(request_id, None)
+                if pending is not None:
+                    future, return_metrics = pending
+                else:
+                    future = None
+                    return_metrics = False
                 if future is not None and not future.done():
-                    future.set_result(output["text"])
+                    future.set_result(output if return_metrics else output["text"])
                 else:
                     logger.warning(
                         "收到未知 request_id 的输出: %s", request_id
@@ -320,7 +329,15 @@ class MPClient:
 
     # ---- 推理接口 ----
 
-    async def generate(self, prompt: str, max_tokens: int = 100) -> str:
+    async def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 100,
+        *,
+        return_metrics: bool = False,
+        request_start_ns: int | None = None,
+        ignore_eos: bool = False,
+    ) -> str | dict[str, Any]:
         """发送推理请求到引擎后端, 等待返回结果
 
         流程:
@@ -343,12 +360,14 @@ class MPClient:
             "request_id": request_id,
             "prompt": prompt,
             "max_tokens": max_tokens,
+            "benchmark_start_ns": request_start_ns,
+            "ignore_eos": ignore_eos,
         }
 
         # 创建 Future 用于等待结果
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[str] = loop.create_future()
-        self._pending_requests[request_id] = future
+        future: asyncio.Future[Any] = loop.create_future()
+        self._pending_requests[request_id] = (future, return_metrics)
 
         # 通过 ROUTER 发送到引擎（发送给第一个引擎）
         # ROUTER.send_multipart([identity, json_data])
