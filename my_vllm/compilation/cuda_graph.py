@@ -189,6 +189,9 @@ class FullDecodeCUDAGraphRunner:
         ):
             output = self.runnable(model_inputs)
         current_stream.wait_stream(capture_stream)
+        # 不依赖不同 PyTorch 版本对“capture 时是否同时产出可消费结果”的
+        # 细节：首次建图后明确 replay 一次，保证返回给 sampler 的 output 已写好。
+        graph.replay()
         torch.cuda.synchronize(self.device)
         logger.debug("CUDA Graph capture完成：%s", key)
         return _CUDAGraphEntry(
