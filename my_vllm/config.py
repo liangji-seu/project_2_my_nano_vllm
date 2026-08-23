@@ -80,6 +80,11 @@ class EngineConfig:
     max_num_seqs: int = 32             # 同时处于 RUNNING 状态的请求数上限
     max_num_batched_tokens: int = 2048  # 单步调度（一个 batch）的 token 预算
 
+    # ---- CUDA Graph（第一阶段只捕获纯 Decode 的整模型 forward）----
+    enable_cuda_graph: bool = True
+    cuda_graph_seq_len_bucket_size: int = 256
+    cuda_graph_num_warmups: int = 1
+
     # 并行配置（TP/PP），预留给后续并行优化
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
 
@@ -105,6 +110,11 @@ class EngineConfig:
             enable_prefix_caching=not getattr(args, "disable_prefix_caching", False),
             max_num_seqs=getattr(args, "max_num_seqs", 32),
             max_num_batched_tokens=getattr(args, "max_num_batched_tokens", 2048),
+            enable_cuda_graph=not getattr(args, "disable_cuda_graph", False),
+            cuda_graph_seq_len_bucket_size=getattr(
+                args, "cuda_graph_seq_len_bucket_size", 256
+            ),
+            cuda_graph_num_warmups=getattr(args, "cuda_graph_num_warmups", 1),
             parallel_config=ParallelConfig(
                 tensor_parallel_size=getattr(args, "tp_size", 1),
                 pipeline_parallel_size=getattr(args, "pp_size", 1),
@@ -230,5 +240,22 @@ def make_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=2048,
         help="单步调度（一个 batch）的 token 预算",
+    )
+    parser.add_argument(
+        "--disable-cuda-graph",
+        action="store_true",
+        help="禁用纯 Decode FULL CUDA Graph，所有 batch 均使用 eager forward",
+    )
+    parser.add_argument(
+        "--cuda-graph-seq-len-bucket-size",
+        type=int,
+        default=256,
+        help="纯 Decode 图的 max_seq_len 分桶步长",
+    )
+    parser.add_argument(
+        "--cuda-graph-num-warmups",
+        type=int,
+        default=1,
+        help="每种 FULL CUDA Graph 规格捕获前的旁路 stream warmup 次数",
     )
     return parser

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+from my_vllm.compilation.cuda_graph import FullDecodeCUDAGraphRunner
 from my_vllm.attention.metadata import (
     FullAttentionMetadata,
     FullAttentionMetadataCollection,
@@ -51,6 +52,8 @@ class ModelForwardInputs:
     positions: torch.Tensor
     attention_metadata: FullAttentionMetadataCollection
     logits_indices: torch.Tensor
+    # 只有每个请求已有历史 KV 且本轮恰好调度一个 token 时为 True。
+    is_decode: bool
 
 
 class GPUModelRunner:
@@ -120,6 +123,7 @@ class GPUModelRunner:
         self.last_prepared_inputs: PreparedInputBuffers | None = None
         self.last_attention_metadata: FullAttentionMetadataCollection | None = None
         self.last_model_inputs: ModelForwardInputs | None = None
+        self.decode_cuda_graph: FullDecodeCUDAGraphRunner | None = None
 
     def _make_buffer(
         self,
@@ -174,6 +178,21 @@ class GPUModelRunner:
             len(loaded),
             self.model_memory_usage / 1024**3,
         )
+        if self.device.type == "cuda" and self.vllm_config.enable_cuda_graph:
+            self.decode_cuda_graph = FullDecodeCUDAGraphRunner(
+                self.model_forward,
+                device=self.device,
+                seq_len_bucket_size=(
+                    self.vllm_config.cuda_graph_seq_len_bucket_size
+                ),
+                num_warmups=self.vllm_config.cuda_graph_num_warmups,
+            )
+            logger.info(
+                "【FULL CUDA Graph】已启用纯 Decode 捕获："
+                "seq_len_bucket=%d, warmups=%d；Prefill/混合 batch 保持 eager",
+                self.vllm_config.cuda_graph_seq_len_bucket_size,
+                self.vllm_config.cuda_graph_num_warmups,
+            )
 
     def get_kv_cache_spec(self) -> dict[str, FullAttentionSpec]:
         if self.is_mock_model:
@@ -594,6 +613,19 @@ class GPUModelRunner:
         ]
         max_query_len = max(query_lens_cpu)
         max_seq_len = max(seq_lens_cpu)
+        is_decode = (
+            prepared.num_tokens == prepared.num_reqs
+            and all(query_len == 1 for query_len in query_lens_cpu)
+            and all(
+                int(self.input_batch.num_computed_tokens_cpu[req_index]) > 0
+                for req_index in range(prepared.num_reqs)
+            )
+        )
+        if is_decode and self.decode_cuda_graph is not None:
+            # 【FULL CUDA Graph】Triton launch 的 max_seq_len 是录图后的静态
+            # kernel 参数。向上取桶后，同一个请求数可在桶内复用一张图；真实
+            # seq_lens 每轮仍覆写固定 GPU buffer，多出来的 K/V 范围会被 mask。
+            max_seq_len = self.decode_cuda_graph.bucket_seq_len(max_seq_len)
 
         for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
             spec = group.kv_cache_spec
@@ -677,6 +709,15 @@ class GPUModelRunner:
             positions=prepared.positions,
             attention_metadata=attention_metadata,
             logits_indices=logits_indices,
+            is_decode=all(
+                metadata.max_query_len == 1
+                and metadata.num_actual_tokens == metadata.num_reqs
+                for metadata in attention_metadata.by_group.values()
+            )
+            and all(
+                int(self.input_batch.num_computed_tokens_cpu[req_index]) > 0
+                for req_index in range(prepared.num_reqs)
+            ),
         )
         self.last_model_inputs = model_inputs
         return model_inputs
@@ -739,7 +780,13 @@ class GPUModelRunner:
             if model_inputs is None:
                 sampled_token_ids = [[] for _ in req_ids]
             else:
-                hidden_states = self.model_forward(model_inputs)
+                # 【FULL CUDA Graph】只有纯 Decode 进入整模型 capture/replay；
+                # Prefill、Chunked Prefill 和混合 batch 仍直接 eager 执行。
+                hidden_states = (
+                    self.decode_cuda_graph(model_inputs)
+                    if self.decode_cuda_graph is not None
+                    else self.model_forward(model_inputs)
+                )
                 sample_req_indices = [
                     index for index, sample in enumerate(should_sample) if sample
                 ]
