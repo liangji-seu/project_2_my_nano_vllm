@@ -1,15 +1,22 @@
-"""仅针对纯 Decode 的整模型 CUDA Graph 捕获与回放。
+"""CUDA Graph 的描述符、调度器、图条目与模型 wrapper。
 
-这里刻意不实现 piecewise graph：Prefill 和混合 batch 继续 eager，只有每个
-request 本轮都恰好计算一个 token、且已经存在历史 KV 时，才把完整 Qwen2
-forward 录入一张 CUDA Graph。采样和 D2H 仍留在图外。
+本模块按 vLLM 的职责边界拆分：
+
+* :class:`CUDAGraphDispatcher` 只管理合法 ``(mode, BatchDescriptor)`` 库；
+* :class:`CUDAGraphWrapper` 只管理真实图条目并执行 capture/replay；
+* :class:`CUDAGraphEntry` 保存一张图、静态输出和输入地址。
+
+第一阶段仍只实现纯 Decode 的 FULL CUDA Graph。Prefill、混合 batch 以及未命中
+合法描述符的 Decode batch 都明确回退 eager。
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from bisect import bisect_left
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING
 
 import torch
@@ -20,94 +27,192 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class DecodeCUDAGraphKey:
-    """一张 FULL Decode 图的静态启动规格。
+class CUDAGraphMode(str, Enum):
+    """一次模型调用采用的 CUDA Graph 运行模式。"""
 
-    Decode 下 ``num_tokens == num_reqs``。二者仍同时保留在 key 中，让这个
-    约束在调试输出里一眼可见。``max_seq_len`` 是已经向上取整后的 Attention
-    循环上界；真实长度继续由固定地址的 ``seq_lens`` tensor 提供。
+    NONE = "NONE"
+    FULL = "FULL"
+
+
+@dataclass(frozen=True, order=True)
+class BatchDescriptor:
+    """一张静态执行图对应的 batch 规格。
+
+    ``is_uniform`` 表示每个请求本轮 query 长度相同。当前 FULL 模式进一步要求
+    它是纯 Decode，因此 ``num_tokens == num_reqs`` 且每个请求只有一个 query。
+    ``max_seq_len`` 是 Attention kernel 捕获时固定的 K/V 循环上界。
     """
 
     num_tokens: int
     num_reqs: int
     max_seq_len: int
+    is_uniform: bool
 
 
 @dataclass
-class _CUDAGraphEntry:
+class CUDAGraphEntry:
+    """Wrapper 持有的一张已经捕获的 CUDA Graph。"""
+
     graph: torch.cuda.CUDAGraph
     output: torch.Tensor
     input_addresses: tuple[int, ...]
 
 
-class FullDecodeCUDAGraphRunner:
-    """在首次遇到某个 Decode 规格时惰性捕获，之后直接 replay。
+class CUDAGraphDispatcher:
+    """管理合法 ``(mode, BatchDescriptor)``，不持有真实 CUDA Graph。
 
-    外部 ``GPUModelRunner`` 负责把每轮数据覆写到固定 GPU buffer。本类不复制
-    输入，只验证地址没有变化。这与 vLLM 的职责边界一致：wrapper 只负责捕获
-    和回放，静态输入缓冲由 model runner 管理。
+    Dispatcher 在 ``GPUModelRunner.__init__`` 时还是空的；等 KV Cache 和
+    Attention backend 的静态规格确定后，才由 ``initialize_cudagraph_keys``
+    建立合法 key 库。这一点与图捕获本身严格分离。
     """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        max_num_reqs: int,
+        max_model_len: int,
+        capture_batch_sizes: Iterable[int],
+        seq_len_bucket_size: int,
+    ) -> None:
+        if seq_len_bucket_size <= 0:
+            raise ValueError("seq_len_bucket_size 必须大于 0")
+        self.enabled = enabled
+        self.max_num_reqs = max_num_reqs
+        self.max_model_len = max_model_len
+        self.capture_batch_sizes = tuple(
+            sorted(
+                {
+                    int(size)
+                    for size in capture_batch_sizes
+                    if 0 < int(size) <= max_num_reqs
+                }
+            )
+        )
+        self.seq_len_bucket_size = seq_len_bucket_size
+        self.valid_keys: dict[CUDAGraphMode, set[BatchDescriptor]] = {
+            CUDAGraphMode.FULL: set(),
+        }
+        self._seq_len_capture_sizes: tuple[int, ...] = ()
+        self.is_initialized = False
+
+    def initialize_cudagraph_keys(self) -> None:
+        """在 KV Cache 初始化后建立纯 Decode FULL 的合法描述符库。"""
+
+        self.valid_keys[CUDAGraphMode.FULL].clear()
+        if not self.enabled:
+            self.is_initialized = True
+            return
+        if not self.capture_batch_sizes:
+            raise ValueError("启用 CUDA Graph 时至少需要一个 capture batch 档位")
+
+        # 序列长度使用 2 倍递增档位：兼顾短上下文的无效计算和总录图数。
+        # max_model_len 即使不是 2 的幂，也作为最后一个合法档位加入。
+        sizes: list[int] = []
+        size = min(self.seq_len_bucket_size, self.max_model_len)
+        while size < self.max_model_len:
+            sizes.append(size)
+            size *= 2
+        sizes.append(self.max_model_len)
+        self._seq_len_capture_sizes = tuple(sorted(set(sizes)))
+
+        for num_reqs in self.capture_batch_sizes:
+            for max_seq_len in self._seq_len_capture_sizes:
+                self.valid_keys[CUDAGraphMode.FULL].add(
+                    BatchDescriptor(
+                        num_tokens=num_reqs,
+                        num_reqs=num_reqs,
+                        max_seq_len=max_seq_len,
+                        is_uniform=True,
+                    )
+                )
+        self.is_initialized = True
+        logger.info(
+            "【CUDA Graph Dispatcher】合法描述符库初始化完成："
+            "mode=FULL, batch_sizes=%s, seq_len_sizes=%s, keys=%d",
+            self.capture_batch_sizes,
+            self._seq_len_capture_sizes,
+            len(self.valid_keys[CUDAGraphMode.FULL]),
+        )
+
+    def dispatch(
+        self,
+        *,
+        num_tokens: int,
+        num_reqs: int,
+        max_seq_len: int,
+        is_uniform_decode: bool,
+    ) -> tuple[CUDAGraphMode, BatchDescriptor | None]:
+        """为真实 batch 选择 FULL key；无法合法映射时返回 eager。"""
+
+        if (
+            not self.enabled
+            or not self.is_initialized
+            or not is_uniform_decode
+            or num_tokens != num_reqs
+            or num_reqs not in self.capture_batch_sizes
+        ):
+            return CUDAGraphMode.NONE, None
+        index = bisect_left(self._seq_len_capture_sizes, max_seq_len)
+        if index == len(self._seq_len_capture_sizes):
+            return CUDAGraphMode.NONE, None
+        descriptor = BatchDescriptor(
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            max_seq_len=self._seq_len_capture_sizes[index],
+            is_uniform=True,
+        )
+        if descriptor not in self.valid_keys[CUDAGraphMode.FULL]:
+            return CUDAGraphMode.NONE, None
+        return CUDAGraphMode.FULL, descriptor
+
+    def get_capture_descriptors(
+        self,
+    ) -> list[tuple[CUDAGraphMode, BatchDescriptor]]:
+        """返回启动阶段要主动捕获的全部描述符，较大的图优先。"""
+
+        if not self.is_initialized:
+            raise RuntimeError("必须先 initialize_cudagraph_keys")
+        return sorted(
+            (
+                (mode, descriptor)
+                for mode, descriptors in self.valid_keys.items()
+                for descriptor in descriptors
+            ),
+            key=lambda item: (
+                item[1].num_tokens,
+                item[1].max_seq_len,
+            ),
+            reverse=True,
+        )
+
+
+class CUDAGraphWrapper:
+    """包装模型 forward，按 Dispatcher 给出的描述符 capture 或 replay。"""
 
     def __init__(
         self,
         runnable: Callable[["ModelForwardInputs"], torch.Tensor],
         *,
         device: torch.device,
-        seq_len_bucket_size: int,
-        num_warmups: int = 1,
     ) -> None:
         if device.type != "cuda":
-            raise ValueError("FullDecodeCUDAGraphRunner 只支持 CUDA device")
-        if seq_len_bucket_size <= 0:
-            raise ValueError("seq_len_bucket_size 必须大于 0")
-        if num_warmups < 0:
-            raise ValueError("num_warmups 不能为负数")
+            raise ValueError("CUDAGraphWrapper 只支持 CUDA device")
         self.runnable = runnable
         self.device = device
-        self.seq_len_bucket_size = seq_len_bucket_size
-        self.num_warmups = num_warmups
         self.graph_pool = torch.cuda.graph_pool_handle()
-        self.entries: dict[DecodeCUDAGraphKey, _CUDAGraphEntry] = {}
+        self.entries: dict[
+            tuple[CUDAGraphMode, BatchDescriptor], CUDAGraphEntry
+        ] = {}
         self.capture_count = 0
         self.replay_count = 0
-
-    def bucket_seq_len(self, seq_len: int) -> int:
-        """把动态历史长度变成少量可复用的静态 Attention 循环上界。"""
-
-        if seq_len <= 0:
-            raise ValueError("seq_len 必须大于 0")
-        bucket = self.seq_len_bucket_size
-        return ((seq_len + bucket - 1) // bucket) * bucket
+        # 启动 capture_model 完成后关闭，防止真实请求偷偷创建新图。
+        self.capturing_enabled = True
 
     @staticmethod
-    def can_run(model_inputs: "ModelForwardInputs") -> bool:
-        """FULL 图目前只接受已经有历史 KV 的非投机纯 Decode batch。"""
-
-        if not model_inputs.is_decode:
-            return False
-        metadata_values = tuple(model_inputs.attention_metadata.by_group.values())
-        if not metadata_values:
-            return False
-        return all(
-            metadata.max_query_len == 1
-            and metadata.num_actual_tokens == metadata.num_reqs
-            for metadata in metadata_values
-        )
-
-    @staticmethod
-    def _key(model_inputs: "ModelForwardInputs") -> DecodeCUDAGraphKey:
-        metadata = next(iter(model_inputs.attention_metadata.by_group.values()))
-        return DecodeCUDAGraphKey(
-            num_tokens=metadata.num_actual_tokens,
-            num_reqs=metadata.num_reqs,
-            max_seq_len=metadata.max_seq_len,
-        )
-
-    @staticmethod
-    def _input_addresses(model_inputs: "ModelForwardInputs") -> tuple[int, ...]:
-        """收集真正进入整模型图的固定 Tensor 地址，排除图外 logits_indices。"""
-
+    def _input_addresses(
+        model_inputs: "ModelForwardInputs",
+    ) -> tuple[int, ...]:
         addresses = [
             model_inputs.input_ids.data_ptr(),
             model_inputs.positions.data_ptr(),
@@ -129,76 +234,63 @@ class FullDecodeCUDAGraphRunner:
         return tuple(addresses)
 
     @torch.inference_mode()
-    def __call__(self, model_inputs: "ModelForwardInputs") -> torch.Tensor:
-        if not self.can_run(model_inputs):
+    def __call__(
+        self,
+        model_inputs: "ModelForwardInputs",
+        *,
+        mode: CUDAGraphMode,
+        descriptor: BatchDescriptor | None,
+        is_graph_capturing: bool = False,
+    ) -> torch.Tensor:
+        if mode is CUDAGraphMode.NONE or descriptor is None:
             return self.runnable(model_inputs)
 
-        key = self._key(model_inputs)
-        current_addresses = self._input_addresses(model_inputs)
+        key = (mode, descriptor)
+        addresses = self._input_addresses(model_inputs)
         entry = self.entries.get(key)
-        if entry is not None:
-            if current_addresses != entry.input_addresses:
-                raise RuntimeError(
-                    "CUDA Graph replay 输入地址发生变化："
-                    f"key={key}, expected={entry.input_addresses}, "
-                    f"actual={current_addresses}"
-                )
-            entry.graph.replay()
-            self.replay_count += 1
+        if entry is None:
+            if not is_graph_capturing or not self.capturing_enabled:
+                logger.warning("CUDA Graph 未捕获，回退 eager：mode=%s, key=%s", mode, descriptor)
+                return self.runnable(model_inputs)
+            entry = self._capture(model_inputs, addresses)
+            self.entries[key] = entry
+            self.capture_count += 1
+            logger.info("【CUDA Graph Wrapper】主动捕获完成：mode=%s, key=%s", mode.value, descriptor)
             return entry.output
 
-        entry = self._capture(key, model_inputs, current_addresses)
-        self.entries[key] = entry
-        self.capture_count += 1
-        logger.info(
-            "【FULL CUDA Graph】捕获纯 Decode 图：num_reqs=%d, "
-            "num_tokens=%d, max_seq_len_bucket=%d",
-            key.num_reqs,
-            key.num_tokens,
-            key.max_seq_len,
-        )
+        if addresses != entry.input_addresses:
+            raise RuntimeError(
+                "CUDA Graph replay 输入地址发生变化："
+                f"key={key}, expected={entry.input_addresses}, actual={addresses}"
+            )
+        entry.graph.replay()
+        self.replay_count += 1
         return entry.output
 
     def _capture(
         self,
-        key: DecodeCUDAGraphKey,
         model_inputs: "ModelForwardInputs",
         input_addresses: tuple[int, ...],
-    ) -> _CUDAGraphEntry:
-        """先在旁路 stream warmup，再捕获完整 model forward。"""
-
-        current_stream = torch.cuda.current_stream(self.device)
-        warmup_stream = torch.cuda.Stream(device=self.device)
-        warmup_stream.wait_stream(current_stream)
-        with torch.cuda.stream(warmup_stream):
-            for _ in range(self.num_warmups):
-                warmup_output = self.runnable(model_inputs)
-            if self.num_warmups:
-                del warmup_output
-        current_stream.wait_stream(warmup_stream)
-        # 首次捕获是启动阶段的一次性同步；正常 replay 路径没有同步点。
-        torch.cuda.synchronize(self.device)
-
+    ) -> CUDAGraphEntry:
         graph = torch.cuda.CUDAGraph()
         capture_stream = torch.cuda.Stream(device=self.device)
+        current_stream = torch.cuda.current_stream(self.device)
         capture_stream.wait_stream(current_stream)
-        with torch.cuda.graph(
-            graph,
-            pool=self.graph_pool,
-            stream=capture_stream,
-        ):
+        with torch.cuda.graph(graph, pool=self.graph_pool, stream=capture_stream):
             output = self.runnable(model_inputs)
         current_stream.wait_stream(capture_stream)
-        # 不依赖不同 PyTorch 版本对“capture 时是否同时产出可消费结果”的
-        # 细节：首次建图后明确 replay 一次，保证返回给 sampler 的 output 已写好。
+        # capture 是否产生可消费输出在不同 PyTorch 版本中不应成为接口假设。
         graph.replay()
-        torch.cuda.synchronize(self.device)
-        logger.debug("CUDA Graph capture完成：%s", key)
-        return _CUDAGraphEntry(
+        return CUDAGraphEntry(
             graph=graph,
             output=output,
             input_addresses=input_addresses,
         )
+
+    def finish_capture(self) -> None:
+        """启动主动捕获结束后禁止运行期 capture-on-miss。"""
+
+        self.capturing_enabled = False
 
     def clear(self) -> None:
         self.entries.clear()

@@ -1,56 +1,101 @@
 # 纯 Decode FULL CUDA Graph
 
-## 支持边界
+## 架构与启动顺序
 
-当前实现只捕获纯 Decode 的完整 Qwen2 模型 forward：
+当前实现按照 vLLM 的职责边界拆成以下组件：
+
+```text
+BatchDescriptor
+      ↓
+CUDAGraphDispatcher ── 合法 (mode, key) 描述符库
+      ↓
+CUDAGraphWrapper    ── capture / replay
+      ↓
+CUDAGraphEntry      ── graph / output / input addresses
+```
+
+完整启动顺序为：
+
+```text
+GPUModelRunner.__init__
+    └── 构造空 CUDAGraphDispatcher
+
+GPUModelRunner.load_model
+    └── 用 CUDAGraphWrapper 包装 model_forward
+
+GPUModelRunner.initialize_kv_cache
+    ├── 分配并绑定分页 KV Cache
+    └── initialize_cudagraph_keys()
+          └── 建立合法 (FULL, BatchDescriptor) 库
+
+GPUModelRunner.capture_model
+    └── 遍历 Dispatcher 的全部合法描述符
+          ├── _dummy_run(mode=NONE)  eager warmup
+          └── _dummy_run(mode=FULL)  触发 Wrapper capture
+
+GPUModelRunner.execute_model
+    ├── Dispatcher 根据真实 batch 选择 mode/key
+    └── Wrapper
+          ├── FULL + entry 命中：replay
+          └── NONE：eager
+```
+
+启动主动捕获结束后，Wrapper 会关闭 capture-on-miss。真实请求没有命中合法
+描述符时直接 eager，不会在服务期间突然同步录制新图。
+
+## 合法描述符库
+
+`BatchDescriptor` 包含：
+
+```text
+(num_tokens, num_reqs, max_seq_len, is_uniform)
+```
+
+第一阶段只注册纯 Decode FULL key，因此：
+
+```text
+num_tokens == num_reqs
+max_query_len == 1
+is_uniform == True
+```
+
+默认 batch 档位为：
+
+```text
+1, 2, 4, 8, 16, 32
+```
+
+超过 `max_num_seqs` 的档位会在 Dispatcher 初始化时过滤。序列长度从
+`cuda_graph_seq_len_bucket_size` 开始按 2 倍增长，并始终包含
+`max_model_len`。例如 `base=256, max_model_len=4096` 时为：
+
+```text
+256, 512, 1024, 2048, 4096
+```
+
+真实 Decode 的最大序列长度向上匹配最近的合法档位。`seq_lens` 仍是每轮覆写
+的固定地址 GPU tensor，档位超出真实长度的 K/V 范围由 Attention kernel mask。
+当前没有实现请求数 padding，因此 3、5 等未配置 batch size 会回退 eager。
+
+## 捕获边界与固定地址
+
+捕获范围是完整 Qwen2 模型 forward：
 
 ```text
 input_ids / positions / attention metadata 固定缓冲
                          ↓
-embed → 28 × (Attention + MLP) → final norm
+embed → N × (Attention + MLP) → final norm
                          ↓
                     hidden_states
 ```
 
-`lm_head → argmax → D2H` 留在图外，与 vLLM 把采样作为模型 forward 后处理的
-边界一致。Prefill、Chunked Prefill、混合 Prefill/Decode 和 mock CPU 路径继续
-eager 执行；当前没有 PIECEWISE CUDA Graph。
+`lm_head → argmax → D2H` 留在图外。Prefill、Chunked Prefill、混合 batch 和
+mock CPU 路径继续 eager；当前没有 PIECEWISE CUDA Graph。
 
-纯 Decode 的判定条件为：
-
-- batch 中每个请求进入本轮前已经有历史 KV；
-- 每个请求本轮恰好调度 1 token；
-- `num_actual_tokens == num_reqs` 且 `max_query_len == 1`。
-
-## 固定地址与图的 key
-
-`GPUModelRunner` 启动时已经预分配 `input_ids`、`positions`、`seq_lens`、
-`query_start_loc`、`slot_mapping` 和 `block_table` 的 CPU/GPU 工作缓冲。每轮只
-覆写这些固定地址的内容，因此 CUDA Graph replay 可以继续读取新 batch 数据。
-
-图缓存 key 为：
-
-```text
-(num_tokens, num_reqs, max_seq_len_bucket)
-```
-
-当前没有把请求数 padding 到 capture bucket，所以不同 `num_reqs` 使用不同图。
-Attention Triton kernel 的 `max_seq_len` 是录图后的固定 kernel 参数；实现将它
-按默认 256 tokens 向上取整。同一桶内真实长度仍由 `seq_lens` GPU tensor 提供，
-超过真实长度的 K/V tile 由 Attention mask 屏蔽。
-
-第一次遇到一个 key 时执行：
-
-```text
-旁路 CUDA stream warmup
-        ↓
-捕获完整 model forward
-        ↓
-立即 replay 一次，得到本轮有效输出
-```
-
-后续相同 key 直接 `CUDAGraph.replay()`。wrapper 会记录所有模型输入 tensor 的
-地址；地址改变时拒绝 replay，避免静默读取旧数据。
+`_dummy_run()` 与真实 `execute_model()` 复用 ModelRunner 预分配的
+`input_ids`、`positions`、`query_start_loc`、`seq_lens`、`slot_mapping` 和
+`block_table` 缓冲。Wrapper 在捕获时记录地址，replay 前再次核验，避免静默
+读取已经换址的输入。
 
 ## 参数
 
@@ -60,24 +105,14 @@ CUDA Graph 默认启用：
 my_vllm serve --model /path/to/Qwen2.5-7B-Instruct
 ```
 
-可用参数：
+相关参数：
 
 ```text
 --disable-cuda-graph
+--cuda-graph-capture-sizes 1 2 4 8 16 32
 --cuda-graph-seq-len-bucket-size 256
 --cuda-graph-num-warmups 1
 ```
 
-需要对照 eager 输出或性能时使用 `--disable-cuda-graph`。桶越小，Attention
-无效 mask 计算越少，但会捕获更多图并增加首次捕获成本；桶越大则相反。
-
-## 已验证内容
-
-- CUDA Graph 独立测试：首次 capture 后修改同地址输入，replay 能消费新值；
-- 完整测试：服务器 CUDA 环境 `27 passed`；
-- Qwen2.5-7B 单卡：相同 greedy 请求连续两次 CUDA Graph 输出一致；
-- Qwen2.5-7B 单卡：CUDA Graph 与 `--disable-cuda-graph` 输出逐 token 一致；
-- Qwen2.5-7B 单卡：4 个并发请求均正确完成，未发生 KV/请求串扰。
-
-当前测试证明了执行闭环和输出一致性；CUDA Graph 相对 eager 的 TTFT、TPOT 与
-吞吐收益应在后续 profile 分支复用固定 256-request workload 单独测量。
+档位越密，真实 batch 命中率越高，但启动捕获耗时和 CUDA Graph 元数据开销也
+越大。需要对照 eager 输出或性能时使用 `--disable-cuda-graph`。

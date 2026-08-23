@@ -84,6 +84,8 @@ class EngineConfig:
     enable_cuda_graph: bool = True
     cuda_graph_seq_len_bucket_size: int = 256
     cuda_graph_num_warmups: int = 1
+    # vLLM 风格的主动捕获档位；超过 max_num_seqs 的值会被 Dispatcher 丢弃。
+    cuda_graph_capture_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
 
     # 并行配置（TP/PP），预留给后续并行优化
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
@@ -115,6 +117,9 @@ class EngineConfig:
                 args, "cuda_graph_seq_len_bucket_size", 256
             ),
             cuda_graph_num_warmups=getattr(args, "cuda_graph_num_warmups", 1),
+            cuda_graph_capture_sizes=tuple(
+                getattr(args, "cuda_graph_capture_sizes", (1, 2, 4, 8, 16, 32))
+            ),
             parallel_config=ParallelConfig(
                 tensor_parallel_size=getattr(args, "tp_size", 1),
                 pipeline_parallel_size=getattr(args, "pp_size", 1),
@@ -257,5 +262,12 @@ def make_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="每种 FULL CUDA Graph 规格捕获前的旁路 stream warmup 次数",
+    )
+    parser.add_argument(
+        "--cuda-graph-capture-sizes",
+        type=int,
+        nargs="+",
+        default=(1, 2, 4, 8, 16, 32),
+        help="启动阶段主动捕获的纯 Decode batch size 档位",
     )
     return parser

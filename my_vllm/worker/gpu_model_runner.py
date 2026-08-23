@@ -8,7 +8,12 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from my_vllm.compilation.cuda_graph import FullDecodeCUDAGraphRunner
+from my_vllm.compilation.cuda_graph import (
+    BatchDescriptor,
+    CUDAGraphDispatcher,
+    CUDAGraphMode,
+    CUDAGraphWrapper,
+)
 from my_vllm.attention.metadata import (
     FullAttentionMetadata,
     FullAttentionMetadataCollection,
@@ -123,7 +128,19 @@ class GPUModelRunner:
         self.last_prepared_inputs: PreparedInputBuffers | None = None
         self.last_attention_metadata: FullAttentionMetadataCollection | None = None
         self.last_model_inputs: ModelForwardInputs | None = None
-        self.decode_cuda_graph: FullDecodeCUDAGraphRunner | None = None
+        # 【CUDA Graph Dispatcher】构造 ModelRunner 时只创建空调度器。合法
+        # (mode, BatchDescriptor) 要等 initialize_kv_cache 后才初始化。
+        self.cudagraph_dispatcher = CUDAGraphDispatcher(
+            enabled=(
+                device.type == "cuda" and vllm_config.enable_cuda_graph
+            ),
+            max_num_reqs=self.max_num_reqs,
+            max_model_len=vllm_config.max_model_len,
+            capture_batch_sizes=vllm_config.cuda_graph_capture_sizes,
+            seq_len_bucket_size=vllm_config.cuda_graph_seq_len_bucket_size,
+        )
+        # Wrapper 必须绑定已经加载的 model_forward，因此在 load_model 后构造。
+        self.cudagraph_wrapper: CUDAGraphWrapper | None = None
 
     def _make_buffer(
         self,
@@ -178,18 +195,14 @@ class GPUModelRunner:
             len(loaded),
             self.model_memory_usage / 1024**3,
         )
-        if self.device.type == "cuda" and self.vllm_config.enable_cuda_graph:
-            self.decode_cuda_graph = FullDecodeCUDAGraphRunner(
-                self.model_forward,
-                device=self.device,
-                seq_len_bucket_size=(
-                    self.vllm_config.cuda_graph_seq_len_bucket_size
-                ),
-                num_warmups=self.vllm_config.cuda_graph_num_warmups,
+        if self.cudagraph_dispatcher.enabled:
+            self.cudagraph_wrapper = CUDAGraphWrapper(
+                self.model_forward, device=self.device
             )
             logger.info(
-                "【FULL CUDA Graph】已启用纯 Decode 捕获："
-                "seq_len_bucket=%d, warmups=%d；Prefill/混合 batch 保持 eager",
+                "【CUDA Graph Wrapper】模型包装完成：capture_sizes=%s, "
+                "seq_len_base=%d, warmups=%d；合法 key 将在 KV 初始化后建立",
+                self.vllm_config.cuda_graph_capture_sizes,
                 self.vllm_config.cuda_graph_seq_len_bucket_size,
                 self.vllm_config.cuda_graph_num_warmups,
             )
@@ -317,6 +330,9 @@ class GPUModelRunner:
             )
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
         }
+        # 【CUDA Graph Dispatcher】此时 KV Cache/Attention 静态规格均已确定，
+        # 才建立独立的合法 (mode, key) 描述符库；这里不捕获真实图。
+        self.cudagraph_dispatcher.initialize_cudagraph_keys()
         logger.info(
             "KV Cache 物理初始化完成：layers=%d, blocks=%d, bytes=%.2f GiB",
             len(self.kv_caches),
@@ -337,6 +353,141 @@ class GPUModelRunner:
             input_ids=model_inputs.input_ids,
             positions=model_inputs.positions,
             attention_metadata=model_inputs.attention_metadata,
+        )
+
+    def _make_dummy_model_inputs(
+        self, descriptor: BatchDescriptor
+    ) -> ModelForwardInputs:
+        """用 ModelRunner 的固定地址缓冲构造一轮纯 Decode dummy batch。
+
+        dummy 请求全部指向保留的物理 block 0。它只负责触发 kernel 编译和图
+        捕获，不进入 Scheduler/InputBatch，也不会提交任何请求状态。
+        """
+
+        if self.kv_cache_config is None:
+            raise RuntimeError("必须先 initialize_kv_cache，再构造 CUDA Graph dummy")
+        num_reqs = descriptor.num_reqs
+        num_tokens = descriptor.num_tokens
+        if num_tokens != num_reqs:
+            raise ValueError("当前 FULL dummy 只支持每请求一个 token 的纯 Decode")
+
+        # 【CUDA Graph Dummy】所有 tensor 都复用 execute_model 的固定缓冲地址。
+        self.input_ids.gpu[:num_tokens].zero_()
+        self.positions[:num_tokens].fill_(descriptor.max_seq_len - 1)
+        self.query_start_loc.gpu[: num_reqs + 1].copy_(
+            torch.arange(num_reqs + 1, dtype=torch.int32, device=self.device)
+        )
+        self.seq_lens[:num_reqs].fill_(descriptor.max_seq_len)
+        self.num_computed_tokens[:num_reqs].fill_(descriptor.max_seq_len - 1)
+        self.num_scheduled_tokens.gpu[:num_reqs].fill_(1)
+
+        by_group: dict[int, FullAttentionMetadata] = {}
+        by_layer: dict[str, FullAttentionMetadata] = {}
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            spec = group.kv_cache_spec
+            if not isinstance(spec, FullAttentionSpec):
+                raise NotImplementedError(type(spec).__name__)
+            self.slot_mappings[group_id].gpu[:num_tokens].zero_()
+            self.block_tables[group_id].gpu[:num_reqs].zero_()
+            metadata = FullAttentionMetadata(
+                kv_cache_group_id=group_id,
+                layer_names=tuple(group.layer_names),
+                block_size=spec.block_size,
+                causal=True,
+                num_reqs=num_reqs,
+                num_actual_tokens=num_tokens,
+                max_query_len=1,
+                max_seq_len=descriptor.max_seq_len,
+                query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
+                seq_lens=self.seq_lens[:num_reqs],
+                num_computed_tokens=self.num_computed_tokens[:num_reqs],
+                num_scheduled_tokens=self.num_scheduled_tokens.gpu[:num_reqs],
+                positions=self.positions[:num_tokens],
+                block_table=self.block_tables[group_id].gpu[:num_reqs],
+                slot_mapping=self.slot_mappings[group_id].gpu[:num_tokens],
+            )
+            by_group[group_id] = metadata
+            for layer_name in group.layer_names:
+                by_layer[layer_name] = metadata
+
+        return ModelForwardInputs(
+            input_ids=self.input_ids.gpu[:num_tokens],
+            inputs_embeds=None,
+            positions=self.positions[:num_tokens],
+            attention_metadata=FullAttentionMetadataCollection(
+                by_group=by_group, by_layer=by_layer
+            ),
+            # logits/sampler 在 FULL 模型图外；这里只保留完整输入对象的语义。
+            logits_indices=torch.arange(
+                num_reqs, dtype=torch.int64, device=self.device
+            ),
+            is_decode=True,
+        )
+
+    @torch.inference_mode()
+    def _dummy_run(
+        self,
+        descriptor: BatchDescriptor,
+        *,
+        mode: CUDAGraphMode,
+        is_graph_capturing: bool,
+    ) -> torch.Tensor:
+        """构造 dummy 输入并通过同一个 Wrapper 触发 eager/capture。"""
+
+        if self.cudagraph_wrapper is None:
+            raise RuntimeError("CUDA Graph Wrapper 尚未构造")
+        model_inputs = self._make_dummy_model_inputs(descriptor)
+        return self.cudagraph_wrapper(
+            model_inputs,
+            mode=mode,
+            descriptor=descriptor if mode is not CUDAGraphMode.NONE else None,
+            is_graph_capturing=is_graph_capturing,
+        )
+
+    @torch.inference_mode()
+    def capture_model(self) -> None:
+        """启动阶段主动捕获 Dispatcher 库中的全部 FULL CUDA Graph。
+
+        每个描述符先以 ``NONE`` 模式 eager dummy warmup，让 Triton 编译和动态
+        allocation 发生在 capture 之外；随后以 ``FULL`` 模式再次 dummy_run，
+        由 Wrapper 创建 ``CUDAGraphEntry``。捕获完成后关闭运行期惰性录图。
+        """
+
+        if not self.cudagraph_dispatcher.enabled:
+            return
+        if self.cudagraph_wrapper is None:
+            raise RuntimeError("必须先 load_model，再 capture_model")
+        capture_descriptors = self.cudagraph_dispatcher.get_capture_descriptors()
+        logger.info(
+            "【CUDA Graph Capture】启动主动捕获：graphs=%d, warmups=%d",
+            len(capture_descriptors),
+            self.vllm_config.cuda_graph_num_warmups,
+        )
+        for index, (mode, descriptor) in enumerate(capture_descriptors, start=1):
+            for _ in range(self.vllm_config.cuda_graph_num_warmups):
+                self._dummy_run(
+                    descriptor,
+                    mode=CUDAGraphMode.NONE,
+                    is_graph_capturing=False,
+                )
+            torch.cuda.synchronize(self.device)
+            self._dummy_run(
+                descriptor,
+                mode=mode,
+                is_graph_capturing=True,
+            )
+            logger.info(
+                "【CUDA Graph Capture】进度 %d/%d：mode=%s, key=%s",
+                index,
+                len(capture_descriptors),
+                mode.value,
+                descriptor,
+            )
+        torch.cuda.synchronize(self.device)
+        self.cudagraph_wrapper.finish_capture()
+        logger.info(
+            "【CUDA Graph Capture】启动主动捕获完成：entries=%d",
+            len(self.cudagraph_wrapper.entries),
         )
 
     def _update_states(self, scheduler_output) -> None:
@@ -621,11 +772,19 @@ class GPUModelRunner:
                 for req_index in range(prepared.num_reqs)
             )
         )
-        if is_decode and self.decode_cuda_graph is not None:
-            # 【FULL CUDA Graph】Triton launch 的 max_seq_len 是录图后的静态
-            # kernel 参数。向上取桶后，同一个请求数可在桶内复用一张图；真实
-            # seq_lens 每轮仍覆写固定 GPU buffer，多出来的 K/V 范围会被 mask。
-            max_seq_len = self.decode_cuda_graph.bucket_seq_len(max_seq_len)
+        if is_decode:
+            # 【CUDA Graph Dispatcher】在 metadata 构造阶段先选择合法 key，
+            # 因为 Triton launch 的 max_seq_len 会固化进图。真实 seq_lens 仍在
+            # 固定 GPU tensor 中逐轮覆写，bucket 多出来的范围由 kernel mask。
+            mode, descriptor = self.cudagraph_dispatcher.dispatch(
+                num_tokens=prepared.num_tokens,
+                num_reqs=prepared.num_reqs,
+                max_seq_len=max_seq_len,
+                is_uniform_decode=True,
+            )
+            if mode is CUDAGraphMode.FULL:
+                assert descriptor is not None
+                max_seq_len = descriptor.max_seq_len
 
         for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
             spec = group.kv_cache_spec
@@ -780,13 +939,25 @@ class GPUModelRunner:
             if model_inputs is None:
                 sampled_token_ids = [[] for _ in req_ids]
             else:
-                # 【FULL CUDA Graph】只有纯 Decode 进入整模型 capture/replay；
-                # Prefill、Chunked Prefill 和混合 batch 仍直接 eager 执行。
-                hidden_states = (
-                    self.decode_cuda_graph(model_inputs)
-                    if self.decode_cuda_graph is not None
-                    else self.model_forward(model_inputs)
+                # 【CUDA Graph Dispatch】运行期只选择已主动捕获的 entry 并
+                # replay；Prefill/混合 batch/未命中档位的 Decode 明确走 eager。
+                metadata = next(
+                    iter(model_inputs.attention_metadata.by_group.values())
                 )
+                mode, descriptor = self.cudagraph_dispatcher.dispatch(
+                    num_tokens=metadata.num_actual_tokens,
+                    num_reqs=metadata.num_reqs,
+                    max_seq_len=metadata.max_seq_len,
+                    is_uniform_decode=model_inputs.is_decode,
+                )
+                if self.cudagraph_wrapper is not None:
+                    hidden_states = self.cudagraph_wrapper(
+                        model_inputs,
+                        mode=mode,
+                        descriptor=descriptor,
+                    )
+                else:
+                    hidden_states = self.model_forward(model_inputs)
                 sample_req_indices = [
                     index for index, sample in enumerate(should_sample) if sample
                 ]

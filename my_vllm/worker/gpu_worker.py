@@ -208,6 +208,9 @@ class Worker(WorkerBase):
         """
         self.num_gpu_blocks = kv_cache_config.num_blocks
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        # 【CUDA Graph Capture】KV Cache 与 Dispatcher 合法 key 库就绪后，
+        # 在 Worker 启动阶段主动 dummy_run 捕获，真实请求期间只 replay/eager。
+        self.model_runner.capture_model()
         logger.info(
             "Worker rank=%d 完成【阶段 3/3】Initialize KV Cache (blocks=%d)",
             self.rank,
