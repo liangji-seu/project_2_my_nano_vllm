@@ -39,6 +39,9 @@ class EngineCore:
     def __init__(self, vllm_config: EngineConfig):
         self.vllm_config = vllm_config
         self._is_running = True
+        # 仅保存轻量时间戳，不参与调度决策。用于profile分支精确测量首Token
+        # 到达时间；正式路径没有return_metrics时也只增加一次字典查询。
+        self._benchmark_requests: dict[str, dict[str, int | None]] = {}
         self.tokenizer = None
         if vllm_config.model != "test-model":
             from my_vllm.tokenizer import HuggingFaceTokenizer
@@ -55,6 +58,10 @@ class EngineCore:
         # Worker 先根据真实模型给出 spec 并 profiling；EngineCore 据此生成唯一的
         # KVCacheConfig，再同时交给 GPU 物理张量和 CPU BlockPool 使用。
         self.kv_cache_config = self._initialize_kv_caches()
+        self.memory_profiles = self.model_executor.collective_rpc(
+            "get_memory_profile"
+        )
+        logger.info("BENCHMARK_MEMORY_PROFILE %s", self.memory_profiles)
 
         from my_vllm.v1.core.kv_cache_manager import KVCacheManager
 
@@ -378,11 +385,22 @@ class EngineCoreProc(EngineCore):
                         model_runner_output.sampled_token_ids,
                     )
                 }
-                logger.info("[RPC] execute_model 本轮采样结果: %s", sampled_text)
+                # 每个decode step打印INFO会严重污染TPOT；需要逐Token排查时再
+                # 将日志级别调到DEBUG。
+                logger.debug("[RPC] execute_model 本轮采样结果: %s", sampled_text)
                 if scheduler_output.total_num_scheduled_tokens > 0:
-                    self.scheduler.update_from_output(
+                    step_outputs = self.scheduler.update_from_output(
                         scheduler_output, model_runner_output
                     )
+                    now_ns = time.perf_counter_ns()
+                    for req_id, token_ids in step_outputs.items():
+                        state = self._benchmark_requests.get(req_id)
+                        if (
+                            state is not None
+                            and token_ids
+                            and state["first_token_ns"] is None
+                        ):
+                            state["first_token_ns"] = now_ns
 
             # 4) 回传已结束请求的输出
             self._send_finished_outputs()
@@ -418,18 +436,28 @@ class EngineCoreProc(EngineCore):
             else [ord(ch) for ch in prompt]
         )
         max_tokens = raw.get("max_tokens", self.vllm_config.max_model_len)
-        return Request(
+        request = Request(
             request_id=raw["request_id"],
             prompt_token_ids=prompt_token_ids,
             sampling_params=SamplingParams(
                 max_tokens=max_tokens,
                 stop_token_ids=(
-                    self.tokenizer.eos_token_ids
+                    ()
+                    if raw.get("ignore_eos", False)
+                    else self.tokenizer.eos_token_ids
                     if self.tokenizer is not None
                     else ()
                 ),
             ),
         )
+        benchmark_start_ns = raw.get("benchmark_start_ns")
+        if benchmark_start_ns is not None:
+            self._benchmark_requests[request.request_id] = {
+                "start_ns": int(benchmark_start_ns),
+                "engine_enqueue_ns": time.perf_counter_ns(),
+                "first_token_ns": None,
+            }
+        return request
 
     def _send_finished_outputs(self) -> None:
         """把本步判定结束的请求结果送回 output_queue → 前端
@@ -449,6 +477,33 @@ class EngineCoreProc(EngineCore):
                 "text": self._detokenize(request.output_token_ids),
                 "finish_reason": finish_reason.value if finish_reason else "stop",
             }
+            benchmark_state = self._benchmark_requests.pop(req_id, None)
+            if benchmark_state is not None:
+                finish_ns = time.perf_counter_ns()
+                start_ns = int(benchmark_state["start_ns"])
+                enqueue_ns = int(benchmark_state["engine_enqueue_ns"])
+                first_token_value = benchmark_state["first_token_ns"]
+                first_token_ns = (
+                    int(first_token_value)
+                    if first_token_value is not None
+                    else finish_ns
+                )
+                output_tokens = request.num_output_tokens
+                benchmark_metrics = {
+                    "prompt_tokens": request.num_prompt_tokens,
+                    "output_tokens": output_tokens,
+                    "ttft_ms": (first_token_ns - start_ns) / 1e6,
+                    "engine_queue_ms": (enqueue_ns - start_ns) / 1e6,
+                    "generation_ms": (finish_ns - first_token_ns) / 1e6,
+                    "e2e_engine_ms": (finish_ns - start_ns) / 1e6,
+                    "tpot_ms": (
+                        (finish_ns - first_token_ns) / 1e6 / (output_tokens - 1)
+                        if output_tokens > 1
+                        else 0.0
+                    ),
+                    "num_preemptions": request.num_preemptions,
+                }
+                output["benchmark_metrics"] = benchmark_metrics
             self.output_queue.put(output)
             self.scheduler.requests.pop(req_id, None)
             logger.info(

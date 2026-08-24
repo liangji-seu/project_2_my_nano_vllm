@@ -106,6 +106,7 @@ class Worker(WorkerBase):
         from my_vllm.worker.gpu_model_runner import GPUModelRunner
 
         self.model_runner = GPUModelRunner(self.vllm_config, self.device)
+        self.memory_profile: dict[str, int | float] = {}
 
         logger.info(
             "Worker rank=%d 完成【阶段 1/3】Init Device (device=%s)",
@@ -187,6 +188,14 @@ class Worker(WorkerBase):
                 f"used_before_profile={memory_used_before_profile}, "
                 f"activation_peak={activation_peak}, available={available}"
             )
+        self.memory_profile = {
+            "total_memory_bytes": self.total_memory,
+            "requested_memory_bytes": requested_memory,
+            "model_weights_bytes": self.model_runner.model_memory_usage,
+            "used_before_profile_bytes": memory_used_before_profile,
+            "activation_peak_bytes": activation_peak,
+            "available_kv_bytes": available,
+        }
         logger.info(
             "显存 profiling：total=%.2f GiB, requested=%.2f GiB, "
             "weights=%.2f GiB, activation_peak=%.2f GiB, available_kv=%.2f GiB",
@@ -208,9 +217,41 @@ class Worker(WorkerBase):
         """
         self.num_gpu_blocks = kv_cache_config.num_blocks
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        self.memory_profile.update(
+            {
+                "num_gpu_blocks": kv_cache_config.num_blocks,
+                "kv_cache_bytes": sum(
+                    tensor.size for tensor in kv_cache_config.kv_cache_tensors
+                ),
+                "allocated_after_kv_bytes": torch.cuda.memory_allocated(
+                    self.device
+                ),
+                "reserved_after_kv_bytes": torch.cuda.memory_reserved(
+                    self.device
+                ),
+            }
+        )
         # 【CUDA Graph Capture】KV Cache 与 Dispatcher 合法 key 库就绪后，
         # 在 Worker 启动阶段主动 dummy_run 捕获，真实请求期间只 replay/eager。
         self.model_runner.capture_model()
+        self.memory_profile.update(
+            {
+                "allocated_after_cudagraph_bytes": torch.cuda.memory_allocated(
+                    self.device
+                ),
+                "reserved_after_cudagraph_bytes": torch.cuda.memory_reserved(
+                    self.device
+                ),
+                "peak_allocated_after_cudagraph_bytes": (
+                    torch.cuda.max_memory_allocated(self.device)
+                ),
+                "cudagraph_entries": (
+                    len(self.model_runner.cudagraph_wrapper.entries)
+                    if self.model_runner.cudagraph_wrapper is not None
+                    else 0
+                ),
+            }
+        )
         logger.info(
             "Worker rank=%d 完成【阶段 3/3】Initialize KV Cache (blocks=%d)",
             self.rank,
@@ -218,6 +259,29 @@ class Worker(WorkerBase):
         )
         # 回传 ack，供 EngineCore 确认本 worker 已完成
         return self.rank
+
+    def get_memory_profile(self) -> dict[str, int | float]:
+        """返回 profiling、KV 初始化和 CUDA Graph 捕获后的显存快照。"""
+
+        profile = dict(self.memory_profile)
+        if self.device.type == "cuda":
+            free_memory, total_memory = torch.cuda.mem_get_info(self.device)
+            profile.update(
+                {
+                    "runtime_free_bytes": free_memory,
+                    "runtime_total_bytes": total_memory,
+                    "runtime_allocated_bytes": torch.cuda.memory_allocated(
+                        self.device
+                    ),
+                    "runtime_reserved_bytes": torch.cuda.memory_reserved(
+                        self.device
+                    ),
+                    "runtime_peak_allocated_bytes": (
+                        torch.cuda.max_memory_allocated(self.device)
+                    ),
+                }
+            )
+        return profile
 
     def execute_model(self, scheduler_output):
         """执行一次模型前向（委托 model_runner）"""
