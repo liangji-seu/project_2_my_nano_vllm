@@ -50,3 +50,14 @@ python benchmarks/benchmark_online_serving.py \
 优化实验继续使用完全相同的请求文件与服务参数。实测总Token Throughput由
 1,613.898 tok/s提升到3,231.884 tok/s（+100.25%），平均TPOT由87.30 ms
 降到42.33 ms（-51.51%）；该版本尚未启用CUDA Graph。
+
+纯Decode FULL CUDA Graph实验继续复用同一请求集，并增加同机
+`--disable-cuda-graph` A/B。正式结果见：
+
+- `benchmarks/results/qwen2_5_7b_cudagraph_256req_c16.md`
+- `benchmarks/results/qwen2_5_7b_cudagraph_256req_c16_manifest.json`
+- `benchmarks/results/qwen2_5_7b_baseline_vs_flashattention_vs_cudagraph.md`
+
+在固定步长256的sequence bucket、80张启动图下，总Token Throughput相对同机
+Eager由3,210.711提升到3,269.680 tok/s（+1.84%），平均TPOT由42.59 ms降到
+41.77 ms（-1.94%）；GPU进程峰值显存增加1,786 MiB。

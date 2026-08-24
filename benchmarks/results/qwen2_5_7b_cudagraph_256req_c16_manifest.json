@@ -1,0 +1,82 @@
+{
+  "experiment": {
+    "id": "qwen2.5-7b-full-cudagraph-256req-c16-20260824",
+    "date": "2026-08-24T23:32:55+08:00",
+    "branch": "cudagraph/profile/qwen2.5_7B",
+    "cuda_graph_tag_commit": "58b3d2c",
+    "benchmark_runtime_commit": "b2beaa5",
+    "raw_result_commit": "0affdc6"
+  },
+  "model": {
+    "name": "Qwen2.5-7B-Instruct-1M",
+    "path": "/home/liangji/huggingface/Qwen2.5-7B-Instruct-1M",
+    "dtype": "bfloat16",
+    "tensor_parallel_size": 1,
+    "pipeline_parallel_size": 1
+  },
+  "server": {
+    "max_model_len": 4096,
+    "max_num_seqs": 16,
+    "max_num_batched_tokens_token_budget": 2048,
+    "num_gpu_blocks_including_null": 4097,
+    "kv_block_size_tokens": 16,
+    "prefix_caching": false,
+    "cuda_graph_mode": "pure decode FULL",
+    "capture_batch_sizes": [1, 2, 4, 8, 16],
+    "capture_sequence_sizes": {
+      "start": 256,
+      "stop": 4096,
+      "step": 256
+    },
+    "cudagraph_entries": 80,
+    "request_count_padding": false
+  },
+  "workload": {
+    "file": "benchmarks/workloads/qwen2_5_7b_256req_1024prompt_128output.jsonl",
+    "sha256": "991592d2a65f7d456adb9909f7ead6a272095d8da4dc14c518a5622e08ae04bc",
+    "num_requests": 256,
+    "closed_loop_concurrency": 16,
+    "prompt_tokens_per_request": 1024,
+    "output_tokens_per_request": 128,
+    "ignore_eos": true,
+    "warmup_requests": 2
+  },
+  "memory": {
+    "model_weights_bytes": 15276321792,
+    "activation_peak_bytes": 286425088,
+    "kv_cache_bytes": 3759013888,
+    "allocated_after_kv_bytes": 19045016576,
+    "allocated_after_cudagraph_bytes": 19354757120,
+    "reserved_after_kv_bytes": 19258146816,
+    "reserved_after_cudagraph_bytes": 20065550336,
+    "gpu_process_peak_memory_mib": 21264.0,
+    "eager_gpu_process_peak_memory_mib": 19478.0
+  },
+  "performance": {
+    "duration_s": 90.19597999798134,
+    "request_throughput_rps": 2.8382639670385474,
+    "total_token_throughput_tokens_per_s": 3269.6800900284065,
+    "ttft_ms_mean": 319.29314371875,
+    "tpot_ms_mean": 41.76842646010704,
+    "client_e2e_ms_mean": 5624.990720076312,
+    "preemptions_total": 0
+  },
+  "same_run_eager_control": {
+    "raw_result": "benchmarks/results/qwen2_5_7b_eager_control_256req_c16.json",
+    "duration_s": 91.85256430902518,
+    "total_token_throughput_tokens_per_s": 3210.710579704771,
+    "ttft_ms_mean": 317.9568123984375,
+    "tpot_ms_mean": 42.59364425765871,
+    "duration_change_percent": -1.8035,
+    "total_token_throughput_change_percent": 1.8366,
+    "ttft_change_percent": 0.4203,
+    "tpot_change_percent": -1.9374
+  },
+  "artifacts": {
+    "raw_cudagraph": "benchmarks/results/qwen2_5_7b_cudagraph_256req_c16.json",
+    "raw_eager_control": "benchmarks/results/qwen2_5_7b_eager_control_256req_c16.json",
+    "report": "benchmarks/results/qwen2_5_7b_cudagraph_256req_c16.md",
+    "three_stage_comparison": "benchmarks/results/qwen2_5_7b_baseline_vs_flashattention_vs_cudagraph.md"
+  }
+}
+
