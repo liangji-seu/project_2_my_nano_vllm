@@ -91,7 +91,7 @@ def test_dispatcher_builds_independent_valid_mode_key_library():
 
     dispatcher.initialize_cudagraph_keys()
     assert dispatcher.capture_batch_sizes == (1, 2, 4, 8)
-    assert len(dispatcher.valid_keys[CUDAGraphMode.FULL]) == 20
+    assert len(dispatcher.valid_keys[CUDAGraphMode.FULL]) == 64
 
     mode, descriptor = dispatcher.dispatch(
         num_tokens=2,
@@ -100,7 +100,7 @@ def test_dispatcher_builds_independent_valid_mode_key_library():
         is_uniform_decode=True,
     )
     assert mode is CUDAGraphMode.FULL
-    assert descriptor == BatchDescriptor(2, 2, 1024, True)
+    assert descriptor == BatchDescriptor(2, 2, 768, True)
 
     # 未配置的 batch size 和非纯 Decode 不允许偷偷惰性建图。
     assert dispatcher.dispatch(

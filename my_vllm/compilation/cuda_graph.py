@@ -106,13 +106,16 @@ class CUDAGraphDispatcher:
         if not self.capture_batch_sizes:
             raise ValueError("启用 CUDA Graph 时至少需要一个 capture batch 档位")
 
-        # 序列长度使用 2 倍递增档位：兼顾短上下文的无效计算和总录图数。
-        # max_model_len 即使不是 2 的幂，也作为最后一个合法档位加入。
-        sizes: list[int] = []
-        size = min(self.seq_len_bucket_size, self.max_model_len)
-        while size < self.max_model_len:
-            sizes.append(size)
-            size *= 2
+        # Attention kernel 把 max_seq_len 固化在 graph launch 参数中。使用固定
+        # 步长档位，避免 1025 token 被映射到 2048 后产生接近一倍的无效 KV
+        # 扫描。max_model_len 不是步长整数倍时仍作为最后一个合法档位加入。
+        sizes = list(
+            range(
+                min(self.seq_len_bucket_size, self.max_model_len),
+                self.max_model_len + 1,
+                self.seq_len_bucket_size,
+            )
+        )
         sizes.append(self.max_model_len)
         self._seq_len_capture_sizes = tuple(sorted(set(sizes)))
 

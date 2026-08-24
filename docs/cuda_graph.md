@@ -66,11 +66,11 @@ is_uniform == True
 ```
 
 超过 `max_num_seqs` 的档位会在 Dispatcher 初始化时过滤。序列长度从
-`cuda_graph_seq_len_bucket_size` 开始按 2 倍增长，并始终包含
-`max_model_len`。例如 `base=256, max_model_len=4096` 时为：
+`cuda_graph_seq_len_bucket_size` 使用固定步长增长，并始终包含
+`max_model_len`。例如 `bucket_size=256, max_model_len=4096` 时为：
 
 ```text
-256, 512, 1024, 2048, 4096
+256, 512, 768, 1024, 1280, ..., 3840, 4096
 ```
 
 真实 Decode 的最大序列长度向上匹配最近的合法档位。`seq_lens` 仍是每轮覆写
