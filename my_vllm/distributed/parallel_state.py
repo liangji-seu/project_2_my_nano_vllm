@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 # 全局通信组（模块级单例）。vLLM 也这么做：进程内只有一份分组信息。
 _TP: ProcessGroup | None = None
 _PP: ProcessGroup | None = None
+_TP_SIZE = 1
+_PP_SIZE = 1
+_TP_RANK = 0
+_PP_RANK = 0
 
 
 def init_distributed_environment(
@@ -83,7 +87,7 @@ def init_model_parallel_group(
     - PP 组：同一 TP 位置、不同 PP stage 的 rank 归为一组
       例 TP=2, PP=2, world=4 → PP 组: [0,2] 和 [1,3]
     """
-    global _TP, _PP
+    global _TP, _PP, _TP_SIZE, _PP_SIZE, _TP_RANK, _PP_RANK
 
     assert dist.is_initialized(), "必须先调用 init_distributed_environment()"
 
@@ -95,8 +99,15 @@ def init_model_parallel_group(
         f"× pp({pipeline_parallel_size})"
     )
 
+    if tensor_parallel_size < 1 or pipeline_parallel_size < 1:
+        raise ValueError("tensor_parallel_size 和 pipeline_parallel_size 必须 >= 1")
+
     tp_rank = rank % tensor_parallel_size
     pp_rank = rank // tensor_parallel_size
+    _TP_SIZE = tensor_parallel_size
+    _PP_SIZE = pipeline_parallel_size
+    _TP_RANK = tp_rank
+    _PP_RANK = pp_rank
 
     # 构造所有 TP 组的 rank 列表：每 tp 个连续 rank 组成一个 PP stage
     tp_groups = [
@@ -109,13 +120,19 @@ def init_model_parallel_group(
         for tp in range(tensor_parallel_size)
     ]
 
-    # 创建本进程所在的通信组。
-    # 注意：dist.new_group() 是集合操作，所有 rank 必须按相同顺序调用相同次数，
-    # 且同一组内的成员必须传入相同的 rank 列表。
-    if tensor_parallel_size > 1:
-        _TP = dist.new_group(tp_groups[pp_rank])
-    if pipeline_parallel_size > 1:
-        _PP = dist.new_group(pp_groups[tp_rank])
+    # new_group 是集合操作：每个 rank 都必须以完全相同的顺序创建全部子组。
+    # 仅创建本 rank 所在的组会让不同 rank 调用次数不一致，最终造成 NCCL/Gloo 死锁。
+    _TP = None
+    for ranks in tp_groups:
+        group = dist.new_group(ranks) if tensor_parallel_size > 1 else None
+        if rank in ranks:
+            _TP = group
+
+    _PP = None
+    for ranks in pp_groups:
+        group = dist.new_group(ranks) if pipeline_parallel_size > 1 else None
+        if rank in ranks:
+            _PP = group
 
     logger.info(
         "模型并行组初始化完成 (rank=%d, tp_rank=%d, pp_rank=%d)",
@@ -139,26 +156,64 @@ def get_pp_group() -> ProcessGroup | None:
 
 
 def get_tensor_model_parallel_world_size() -> int:
-    return _TP.size() if _TP is not None else 1
+    return _TP_SIZE
 
 
 def get_tensor_model_parallel_rank() -> int:
-    return dist.get_rank(_TP) if _TP is not None else 0
+    return _TP_RANK
 
 
 def get_pipeline_model_parallel_world_size() -> int:
-    return _PP.size() if _PP is not None else 1
+    return _PP_SIZE
 
 
 def get_pipeline_model_parallel_rank() -> int:
-    return dist.get_rank(_PP) if _PP is not None else 0
+    return _PP_RANK
+
+
+def tensor_model_parallel_all_reduce(tensor: torch.Tensor) -> torch.Tensor:
+    """对 TP 组执行原地 SUM all-reduce，并返回同一张量。"""
+    if _TP is not None:
+        dist.all_reduce(tensor, group=_TP)
+    return tensor
+
+
+def get_pipeline_model_parallel_prev_rank() -> int | None:
+    """返回同一 TP lane 上的前一 PP stage 全局 rank。"""
+    if _PP_RANK == 0:
+        return None
+    return (_PP_RANK - 1) * _TP_SIZE + _TP_RANK
+
+
+def get_pipeline_model_parallel_next_rank() -> int | None:
+    """返回同一 TP lane 上的后一 PP stage 全局 rank。"""
+    if _PP_RANK == _PP_SIZE - 1:
+        return None
+    return (_PP_RANK + 1) * _TP_SIZE + _TP_RANK
+
+
+def pipeline_model_parallel_send(tensor: torch.Tensor) -> None:
+    """将 activation 发送给同一 TP lane 的下一 PP stage。"""
+    destination = get_pipeline_model_parallel_next_rank()
+    if destination is not None:
+        dist.send(tensor.contiguous(), dst=destination)
+
+
+def pipeline_model_parallel_recv(tensor: torch.Tensor) -> torch.Tensor:
+    """从同一 TP lane 的上一 PP stage 原地接收 activation。"""
+    source = get_pipeline_model_parallel_prev_rank()
+    if source is not None:
+        dist.recv(tensor, src=source)
+    return tensor
 
 
 def destroy_model_parallel() -> None:
     """销毁 TP/PP 通信组（worker 关闭时调用）"""
-    global _TP, _PP
+    global _TP, _PP, _TP_SIZE, _PP_SIZE, _TP_RANK, _PP_RANK
     _TP = None
     _PP = None
+    _TP_SIZE = _PP_SIZE = 1
+    _TP_RANK = _PP_RANK = 0
 
 
 def destroy_distributed_environment() -> None:
