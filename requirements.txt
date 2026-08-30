@@ -13,6 +13,7 @@ starlette>=0.37              # FastAPI 底层框架 (State, 中间件等)
 pydantic>=2.0                # 请求/响应模型校验 (FastAPI 自带，这里显式声明)
 
 # --- Tokenizer (CPU only, 用于测 scheduler / block manager) ---
+numpy>=1.24                  # InputBatch/CpuGpuBuffer 的 NumPy CPU 视图
 # 不装 transformers (会拖 PyTorch 进来), 只装轻量的 tokenizers
 tokenizers>=0.19             # HuggingFace Rust tokenizer, 纯 CPU, 不依赖 PyTorch
 safetensors>=0.4             # mmap 流式加载 Hugging Face safetensors 权重
