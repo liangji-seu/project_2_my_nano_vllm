@@ -8,6 +8,7 @@ decoder layers 按 PP stage 连续分段。
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -96,6 +97,15 @@ class ColumnParallelLinear(nn.Module):
             if bias
             else None
         )
+        self.reset_parameters(input_size)
+
+    def reset_parameters(self, input_size: int) -> None:
+        # 与 torch.nn.Linear 的默认初始化一致；meta 构造时该调用不分配内存，
+        # checkpoint loader 随后仍会替换成真实 shard。
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            bound = 1 / math.sqrt(input_size)
+            nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
@@ -156,6 +166,10 @@ class RowParallelLinear(nn.Module):
             torch.empty(output_size, self.input_size_per_partition)
         )
         self.bias = nn.Parameter(torch.empty(output_size)) if bias else None
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            bound = 1 / math.sqrt(self.input_size_per_partition)
+            nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         output = F.linear(x, self.weight, None)
@@ -181,6 +195,7 @@ class VocabParallelEmbedding(nn.Module):
         self.weight = nn.Parameter(
             torch.empty(self.num_embeddings_per_partition, hidden_size)
         )
+        nn.init.normal_(self.weight)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         outside = (input_ids < self.vocab_start_index) | (
