@@ -18,6 +18,13 @@ from my_vllm.attention.metadata import (
     FullAttentionMetadata,
     FullAttentionMetadataCollection,
 )
+from my_vllm.distributed.parallel_state import (
+    get_pipeline_model_parallel_world_size,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+    pipeline_model_parallel_irecv,
+    pipeline_model_parallel_isend,
+)
 from my_vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from my_vllm.worker.cpu_gpu_buffer import CpuGpuBuffer
 from my_vllm.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -128,11 +135,18 @@ class GPUModelRunner:
         self.last_prepared_inputs: PreparedInputBuffers | None = None
         self.last_attention_metadata: FullAttentionMetadataCollection | None = None
         self.last_model_inputs: ModelForwardInputs | None = None
+        # 【PP activation P2P】异步 send 的 Work 与源 tensor 必须一起保活，
+        # 下一批开始前再 wait，语义对应 vLLM 的 delayed send-handle wait。
+        self._pending_pp_send: tuple[torch.Tensor, object] | None = None
         # 【CUDA Graph Dispatcher】构造 ModelRunner 时只创建空调度器。合法
         # (mode, BatchDescriptor) 要等 initialize_kv_cache 后才初始化。
         self.cudagraph_dispatcher = CUDAGraphDispatcher(
             enabled=(
-                device.type == "cuda" and vllm_config.enable_cuda_graph
+                device.type == "cuda"
+                and vllm_config.enable_cuda_graph
+                # PP activation P2P 由 ModelRunner 在 stage graph 外组织；当前
+                # FULL wrapper 尚未把外部 activation 作为静态输入，先走 eager。
+                and get_pipeline_model_parallel_world_size() == 1
             ),
             max_num_reqs=self.max_num_reqs,
             max_model_len=vllm_config.max_model_len,
@@ -161,11 +175,6 @@ class GPUModelRunner:
         if self.is_mock_model:
             logger.info("test-model 使用 mock 执行路径，跳过真实模型权重加载")
             return
-        if self.vllm_config.parallel_config.world_size != 1:
-            raise NotImplementedError(
-                "真实 Qwen2 权重目前只支持 TP=1、PP=1；TP/PP 权重切分属于后续分布式阶段"
-            )
-
         from my_vllm.model_executor.model_loader import load_model
 
         before = (
@@ -254,12 +263,28 @@ class GPUModelRunner:
         vocab_size = int(self.hf_config["vocab_size"])
         input_ids = torch.randint(0, vocab_size, (num_tokens,), device=self.device)
         positions = torch.arange(num_tokens, device=self.device, dtype=torch.int64)
-        hidden_states = self.model(input_ids, positions)
+        if is_pipeline_first_stage():
+            hidden_states = self.model(input_ids, positions)
+        else:
+            # profiling 只测本 rank 的权重和激活峰值，不在 PP stages 之间做
+            # P2P；相同 TP stage 的 ranks 仍同步执行 layer 内 collectives。
+            stage_input = torch.empty(
+                (num_tokens, int(self.hf_config["hidden_size"])),
+                device=self.device,
+                dtype=self.model_dtype,
+            )
+            hidden_states = self.model(
+                None, positions, hidden_states=stage_input
+            )
         # vLLM 只对需要采样的位置算 logits。这里取最多 max_num_seqs 个末尾
         # hidden state，覆盖 logits/sampler 峰值但不引入 InputBatch 状态。
         num_sampled_positions = min(self.vllm_config.max_num_seqs, num_tokens)
-        logits = self.model.compute_logits(hidden_states[-num_sampled_positions:])
-        _ = torch.argmax(logits, dim=-1)
+        logits = None
+        if is_pipeline_last_stage():
+            logits = self.model.compute_logits(
+                hidden_states[-num_sampled_positions:]
+            )
+            _ = torch.argmax(logits, dim=-1)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         del input_ids, positions, hidden_states, logits
@@ -345,15 +370,42 @@ class GPUModelRunner:
 
     @torch.inference_mode()
     def model_forward(self, model_inputs: ModelForwardInputs) -> torch.Tensor:
-        """直接执行已经 preprocess 好的扁平 Qwen2 输入。"""
+        """执行本 PP stage，并沿相同 TP lane 发送/接收 activation。"""
 
         if self.model is None:
             raise RuntimeError("必须先 load_model，再执行真实模型前向")
-        return self.model(
-            input_ids=model_inputs.input_ids,
+        if self._pending_pp_send is not None:
+            _, previous_send = self._pending_pp_send
+            previous_send.wait()
+            self._pending_pp_send = None
+
+        stage_input = None
+        if not is_pipeline_first_stage():
+            stage_input = torch.empty(
+                (
+                    model_inputs.input_ids.shape[0],
+                    int(self.hf_config["hidden_size"]),
+                ),
+                dtype=self.model_dtype,
+                device=self.device,
+            )
+            recv_work = pipeline_model_parallel_irecv(stage_input)
+            assert recv_work is not None
+            # AsyncIntermediateTensors 的最简等价点：直到模型真正消费 activation
+            # 才等待数据到达，而不是在 Scheduler/输入整理阶段提前阻塞。
+            recv_work.wait()
+        hidden_states = self.model(
+            input_ids=model_inputs.input_ids if is_pipeline_first_stage() else None,
             positions=model_inputs.positions,
             attention_metadata=model_inputs.attention_metadata,
+            hidden_states=stage_input,
         )
+        if not is_pipeline_last_stage():
+            send_tensor = hidden_states.contiguous()
+            send_work = pipeline_model_parallel_isend(send_tensor)
+            assert send_work is not None
+            self._pending_pp_send = (send_tensor, send_work)
+        return hidden_states
 
     def _make_dummy_model_inputs(
         self, descriptor: BatchDescriptor
@@ -534,11 +586,16 @@ class GPUModelRunner:
 
         # 4. 已缓存请求只接收 computed 进度和本轮新增 block id。
         cached = scheduler_output.scheduled_cached_reqs
+        cached_output_token_ids = cached.output_token_ids or [
+            list(self.requests[req_id].output_token_ids)
+            for req_id in cached.req_ids
+        ]
         field_lengths = {
             len(cached.req_ids),
             len(cached.new_block_ids),
             len(cached.num_computed_tokens),
             len(cached.num_scheduled_tokens),
+            len(cached_output_token_ids),
         }
         if len(field_lengths) != 1:
             raise ValueError("CachedRequestData 各字段长度不一致")
@@ -552,6 +609,13 @@ class GPUModelRunner:
                 ) from exc
 
             req_state.num_computed_tokens = cached.num_computed_tokens[index]
+            scheduler_output_ids = cached_output_token_ids[index]
+            local_output_count = len(req_state.output_token_ids)
+            if req_state.output_token_ids != scheduler_output_ids[:local_output_count]:
+                raise RuntimeError(f"请求 {req_id} 的 Worker/Scheduler token 状态分叉")
+            missing_output_ids = scheduler_output_ids[local_output_count:]
+            if missing_output_ids:
+                req_state.output_token_ids.extend(missing_output_ids)
             new_block_ids = cached.new_block_ids[index]
             if new_block_ids is not None:
                 for block_ids, new_ids in zip(
@@ -563,6 +627,10 @@ class GPUModelRunner:
             if req_index is None:
                 self.input_batch.add_request(req_state)
             else:
+                if missing_output_ids:
+                    self.input_batch.append_output_token_ids(
+                        req_id, missing_output_ids
+                    )
                 self.input_batch.num_computed_tokens_cpu[req_index] = (
                     req_state.num_computed_tokens
                 )
@@ -962,7 +1030,9 @@ class GPUModelRunner:
                     index for index, sample in enumerate(should_sample) if sample
                 ]
                 sampled_token_ids = [[] for _ in req_ids]
-                if sample_req_indices:
+                # 所有最后 stage 的 TP ranks 都必须进入 ParallelLMHead 的
+                # all-gather；只有 executor 指定的 driver rank 回传 CPU token。
+                if sample_req_indices and is_pipeline_last_stage():
                     assert self.model is not None
                     selected_indices = model_inputs.logits_indices[
                         sample_req_indices

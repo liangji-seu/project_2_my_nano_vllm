@@ -479,9 +479,13 @@ class MultiprocExecutor:
         """让所有 Worker 做 profiling，返回各 rank 的 KV 可用字节数。"""
         return self.collective_rpc("determine_available_memory")
 
-    def initialize_from_config(self, kv_cache_config) -> list:
-        """按完整 KVCacheConfig 初始化物理 KV cache，所有 Worker 回传 ack。"""
-        return self.collective_rpc("initialize_from_config", args=(kv_cache_config,))
+    def initialize_from_config(self, kv_cache_configs) -> list:
+        """把逐 rank KVCacheConfig 广播出去，由 Worker 选择自己的配置。"""
+        if len(kv_cache_configs) != self.world_size:
+            raise ValueError("KV cache config 数量必须等于 world_size")
+        return self.collective_rpc(
+            "initialize_from_config", args=(kv_cache_configs,)
+        )
 
     def check_health(self) -> list:
         """健康检查（用于验证 RPC 通路）"""

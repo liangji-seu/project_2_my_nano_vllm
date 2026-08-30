@@ -86,17 +86,36 @@ class EngineCore:
         from my_vllm.v1.kv_cache_interface import generate_kv_cache_config
 
         worker_specs = self.model_executor.get_kv_cache_specs()
-        reference_spec = worker_specs[0]
-        if any(spec != reference_spec for spec in worker_specs[1:]):
-            raise RuntimeError("不同 Worker 返回的 KV cache spec 不一致")
         available_per_worker = self.model_executor.determine_available_memory()
-        available_memory = min(available_per_worker)
-        kv_cache_config = generate_kv_cache_config(
-            reference_spec,
-            available_memory,
-            num_blocks_override=self.vllm_config.num_gpu_blocks,
+        # 【PP KV 配置】不同 stage 拥有不同 layer_names，不能把 rank0 的配置
+        # 原样广播给所有 worker。先按每个 rank 的本地层数/页大小求容量，再取
+        # 全局最小 block 数，使 Scheduler 的一个逻辑 block id 在所有 stage
+        # 都有对应物理页。
+        capacities = [
+            available // sum(spec.page_size_bytes for spec in specs.values())
+            for available, specs in zip(
+                available_per_worker, worker_specs, strict=True
+            )
+        ]
+        common_num_blocks = (
+            self.vllm_config.num_gpu_blocks
+            if self.vllm_config.num_gpu_blocks is not None
+            else min(capacities)
         )
-        results = self.model_executor.initialize_from_config(kv_cache_config)
+        worker_configs = [
+            generate_kv_cache_config(
+                specs,
+                available,
+                num_blocks_override=common_num_blocks,
+            )
+            for specs, available in zip(
+                worker_specs, available_per_worker, strict=True
+            )
+        ]
+        results = self.model_executor.initialize_from_config(worker_configs)
+        # Scheduler 只消费 group/block_size/num_blocks；单一 FullAttention group
+        # 下任选一个 rank 的本地配置即可，layer_names 仅供对应 Worker 绑定。
+        kv_cache_config = worker_configs[0]
         logger.info(
             "KV cache 初始化完成：available_per_worker=%s, common_blocks=%d, ack=%s",
             available_per_worker,

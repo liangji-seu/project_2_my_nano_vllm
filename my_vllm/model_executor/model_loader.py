@@ -10,6 +10,10 @@ from typing import Iterator
 import torch
 import torch.nn as nn
 
+from my_vllm.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from my_vllm.model_executor.models import MODEL_REGISTRY
 from my_vllm.model_executor.models.qwen2 import Qwen2Config
 
@@ -93,12 +97,45 @@ def _set_parameter(
     tensor: torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
+    *,
+    source_name: str | None = None,
+    packed_shard_id: int | None = None,
 ) -> None:
     path, _, leaf = name.rpartition(".")
     module = model.get_submodule(path) if path else model
     parameter = module._parameters.get(leaf)
     if parameter is None:
         raise KeyError(name)
+    source_name = source_name or name
+    if packed_shard_id is not None:
+        shard_sizes = module.output_sizes_per_partition
+        shard_shape = list(parameter.shape)
+        shard_shape[0] = shard_sizes[packed_shard_id]
+        tensor = _select_tensor_parallel_shard(
+            source_name, tensor, tuple(shard_shape)
+        )
+        if tuple(tensor.shape) != tuple(shard_shape):
+            raise ValueError(
+                f"packed 权重 shape 不匹配 {source_name} -> {name}: "
+                f"expected shard={tuple(shard_shape)}, checkpoint={tuple(tensor.shape)}"
+            )
+        target_dtype = dtype if tensor.is_floating_point() else tensor.dtype
+        if parameter.is_meta:
+            parameter = nn.Parameter(
+                torch.empty(parameter.shape, device=device, dtype=target_dtype),
+                requires_grad=False,
+            )
+            module._parameters[leaf] = parameter
+        offset = sum(shard_sizes[:packed_shard_id])
+        with torch.no_grad():
+            parameter.narrow(0, offset, shard_sizes[packed_shard_id]).copy_(
+                tensor.to(device=device, dtype=target_dtype)
+            )
+        return
+
+    tensor = _select_tensor_parallel_shard(
+        source_name, tensor, tuple(parameter.shape)
+    )
     if tuple(parameter.shape) != tuple(tensor.shape):
         raise ValueError(
             f"权重 shape 不匹配 {name}: model={tuple(parameter.shape)}, "
@@ -109,6 +146,59 @@ def _set_parameter(
         tensor.to(device=device, dtype=target_dtype),
         requires_grad=False,
     )
+
+
+def _map_packed_parameter(name: str) -> tuple[str, int | None]:
+    """把 HF 分立参数名映射到 vLLM 风格 packed parameter。"""
+
+    for shard_id, source in enumerate(("q_proj", "k_proj", "v_proj")):
+        marker = f".{source}."
+        if marker in name:
+            return name.replace(marker, ".qkv_proj."), shard_id
+    for shard_id, source in enumerate(("gate_proj", "up_proj")):
+        marker = f".{source}."
+        if marker in name:
+            return name.replace(marker, ".gate_up_proj."), shard_id
+    return name, None
+
+
+def _select_tensor_parallel_shard(
+    name: str,
+    tensor: torch.Tensor,
+    expected_shape: tuple[int, ...],
+) -> torch.Tensor:
+    """按 vLLM Qwen2 parallel layer 语义选择 checkpoint 的本 rank shard。"""
+
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size == 1 or tuple(tensor.shape) == expected_shape:
+        return tensor
+    tp_rank = get_tensor_model_parallel_rank()
+    column_suffixes = (
+        "embed_tokens.weight",
+        "lm_head.weight",
+        "q_proj.weight",
+        "q_proj.bias",
+        "k_proj.weight",
+        "k_proj.bias",
+        "v_proj.weight",
+        "v_proj.bias",
+        "gate_proj.weight",
+        "up_proj.weight",
+    )
+    row_suffixes = ("o_proj.weight", "down_proj.weight")
+    if name.endswith(column_suffixes):
+        shard_dim = 0
+    elif name.endswith(row_suffixes):
+        shard_dim = 1
+    else:
+        return tensor
+    if tensor.shape[shard_dim] % tp_size:
+        raise ValueError(
+            f"权重 {name} 的 dim={shard_dim} 大小 {tensor.shape[shard_dim]} "
+            f"不能被 TP={tp_size} 整除"
+        )
+    shard_size = tensor.shape[shard_dim] // tp_size
+    return tensor.narrow(shard_dim, tp_rank * shard_size, shard_size)
 
 
 def load_model(
@@ -131,22 +221,39 @@ def load_model(
             _set_parameter(model, name, tensor, device, tensor_dtype)
         loaded = expected
     elif load_format == "safetensors":
+        packed_pieces: dict[str, set[int]] = {}
         for name, tensor in safetensors_weights_iterator(model_path):
             # tied embedding checkpoint 可能带重复 lm_head；模型只保留共享参数一次。
-            target_name = name
+            target_name, packed_shard_id = _map_packed_parameter(name)
             if (
                 name == "lm_head.weight"
-                and name not in expected
+                and target_name not in expected
                 and "model.embed_tokens.weight" in expected
             ):
                 target_name = "model.embed_tokens.weight"
             if target_name not in expected:
                 logger.debug("跳过模型不使用的 checkpoint 权重 %s", name)
                 continue
-            if target_name in loaded:
+            if target_name in loaded and packed_shard_id is None:
                 continue
-            _set_parameter(model, target_name, tensor, device, dtype)
-            loaded.add(target_name)
+            _set_parameter(
+                model,
+                target_name,
+                tensor,
+                device,
+                dtype,
+                source_name=name,
+                packed_shard_id=packed_shard_id,
+            )
+            if packed_shard_id is None:
+                loaded.add(target_name)
+            else:
+                pieces = packed_pieces.setdefault(target_name, set())
+                pieces.add(packed_shard_id)
+                module_path, _, _ = target_name.rpartition(".")
+                required = len(model.get_submodule(module_path).output_sizes_per_partition)
+                if len(pieces) == required:
+                    loaded.add(target_name)
         missing = expected - loaded
         if missing:
             preview = ", ".join(sorted(missing)[:8])
@@ -156,6 +263,7 @@ def load_model(
 
     if getattr(model.config, "tie_word_embeddings", False):
         # 替换 parameter 对象后重新建立共享引用，不能只让两者数值相等。
+        assert model.lm_head is not None and model.model.embed_tokens is not None
         model.lm_head.weight = model.model.embed_tokens.weight
     model.eval()
     return model, hf_config, dtype, loaded

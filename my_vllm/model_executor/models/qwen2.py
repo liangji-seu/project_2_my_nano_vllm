@@ -1,7 +1,9 @@
-"""可读性优先的 Hugging Face 兼容 Qwen2 模型。
+"""Hugging Face 权重兼容、支持 TP/PP 的 Qwen2 推理模型。
 
-这里暂不做 vLLM 的 QKV/MLP packed 参数和 TP 切分，参数名保持 Hugging Face
-原样，目的是把「config 构造参数树 -> checkpoint 名字递归匹配」先做成闭环。
+实现刻意保留 Hugging Face 参数名，便于把 checkpoint 参数直接映射到局部
+shard；执行结构则遵循 vLLM 的模型并行语义：QKV/gate/up 按输出维切分，
+o/down 按输入维切分并 all-reduce，embedding/lm_head 按 vocabulary 切分，
+decoder layers 按 PP stage 连续分段。
 """
 
 from __future__ import annotations
@@ -19,6 +21,16 @@ from my_vllm.attention.triton_flash_attention import (
 from my_vllm.attention.metadata import (
     FullAttentionMetadata,
     FullAttentionMetadataCollection,
+)
+from my_vllm.distributed.parallel_state import (
+    get_pipeline_model_parallel_rank,
+    get_pipeline_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 
 
@@ -61,6 +73,136 @@ class RMSNorm(nn.Module):
         return self.weight * x.to(input_dtype)
 
 
+def _divide(value: int, divisor: int, name: str) -> int:
+    if value % divisor:
+        raise ValueError(f"{name}={value} 必须能被 TP={divisor} 整除")
+    return value // divisor
+
+
+class ColumnParallelLinear(nn.Module):
+    """【TP·列并行】保存输出维 shard，forward 不做集合通信。"""
+
+    def __init__(self, input_size: int, output_size: int, *, bias: bool):
+        super().__init__()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.output_size_per_partition = _divide(
+            output_size, self.tp_size, "linear output_size"
+        )
+        self.weight = nn.Parameter(
+            torch.empty(self.output_size_per_partition, input_size)
+        )
+        self.bias = (
+            nn.Parameter(torch.empty(self.output_size_per_partition))
+            if bias
+            else None
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight, self.bias)
+
+
+class QKVParallelLinear(ColumnParallelLinear):
+    """【TP·QKV packed】把 HF 的 Q/K/V shard 合并为一次局部 GEMM。"""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        total_q_size: int,
+        total_kv_size: int,
+        *,
+        bias: bool,
+    ):
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.output_sizes_per_partition = (
+            _divide(total_q_size, self.tp_size, "Q projection size"),
+            _divide(total_kv_size, self.tp_size, "K projection size"),
+            _divide(total_kv_size, self.tp_size, "V projection size"),
+        )
+        super().__init__(
+            hidden_size,
+            total_q_size + 2 * total_kv_size,
+            bias=bias,
+        )
+
+
+class MergedColumnParallelLinear(ColumnParallelLinear):
+    """【TP·Merged Column】把 gate/up shard 合并为一次局部 GEMM。"""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: tuple[int, ...],
+        *,
+        bias: bool,
+    ):
+        tp_size = get_tensor_model_parallel_world_size()
+        self.output_sizes_per_partition = tuple(
+            _divide(size, tp_size, "merged projection size")
+            for size in output_sizes
+        )
+        super().__init__(input_size, sum(output_sizes), bias=bias)
+
+
+class RowParallelLinear(nn.Module):
+    """【TP·行并行】消费输入维 shard，局部 GEMM 后执行 SUM all-reduce。"""
+
+    def __init__(self, input_size: int, output_size: int, *, bias: bool = False):
+        super().__init__()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.input_size_per_partition = _divide(
+            input_size, self.tp_size, "linear input_size"
+        )
+        self.weight = nn.Parameter(
+            torch.empty(output_size, self.input_size_per_partition)
+        )
+        self.bias = nn.Parameter(torch.empty(output_size)) if bias else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output = F.linear(x, self.weight, None)
+        tensor_model_parallel_all_reduce(output)
+        # bias 只能在 reduce 后加一次，否则会被 TP SUM 放大。
+        if self.bias is not None:
+            output = output + self.bias
+        return output
+
+
+class VocabParallelEmbedding(nn.Module):
+    """【TP·词表并行】每个 rank 只保存连续 vocabulary shard。"""
+
+    def __init__(self, vocab_size: int, hidden_size: int):
+        super().__init__()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.num_embeddings_per_partition = _divide(
+            vocab_size, self.tp_size, "vocab_size"
+        )
+        self.vocab_start_index = self.tp_rank * self.num_embeddings_per_partition
+        self.vocab_end_index = self.vocab_start_index + self.num_embeddings_per_partition
+        self.weight = nn.Parameter(
+            torch.empty(self.num_embeddings_per_partition, hidden_size)
+        )
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        outside = (input_ids < self.vocab_start_index) | (
+            input_ids >= self.vocab_end_index
+        )
+        local_ids = (input_ids - self.vocab_start_index).masked_fill(outside, 0)
+        output = F.embedding(local_ids, self.weight)
+        output.masked_fill_(outside.unsqueeze(-1), 0)
+        return tensor_model_parallel_all_reduce(output)
+
+
+class ParallelLMHead(ColumnParallelLinear):
+    """【TP·并行 LM Head】局部 vocabulary projection 后收集完整 logits。"""
+
+    def __init__(self, hidden_size: int, vocab_size: int):
+        super().__init__(hidden_size, vocab_size, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        local_logits = super().forward(hidden_states)
+        return tensor_model_parallel_all_gather(local_logits, dim=-1)
+
+
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     first, second = x.chunk(2, dim=-1)
     return torch.cat((-second, first), dim=-1)
@@ -69,34 +211,38 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 class Qwen2Attention(nn.Module):
     def __init__(self, config: Qwen2Config):
         super().__init__()
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.num_heads = _divide(
+            config.num_attention_heads, self.tp_size, "num_attention_heads"
+        )
+        self.num_kv_heads = _divide(
+            config.num_key_value_heads, self.tp_size, "num_key_value_heads"
+        )
         self.head_dim = config.hidden_size // config.num_attention_heads
         # 明确区分两个空间：hidden_size 是模型主干中每个 token 的维度；
         # q_size 是全部 Q heads（以及全部 attention 输出 heads）拼接后的维度。
         # Qwen2.5 中二者数值恰好相同，但语义并不相同。
+        self.total_q_size = config.num_attention_heads * self.head_dim
+        self.total_kv_size = config.num_key_value_heads * self.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        if self.q_size != config.hidden_size:
+        if self.total_q_size != config.hidden_size:
             raise ValueError("hidden_size 必须能被 num_attention_heads 整除")
         if self.num_heads % self.num_kv_heads:
             raise ValueError("num_attention_heads 必须能被 num_key_value_heads 整除")
         self.rope_theta = config.rope_theta
         bias = config.attention_bias
-        self.q_proj = nn.Linear(
-            # hidden_size, 是语义空间的维度，就是token向量的维度
-            config.hidden_size, self.q_size, bias=bias
+        self.qkv_proj = QKVParallelLinear(
+            # hidden_size 是 token 语义空间；Q/K/V 输出在 TP rank 内按 head 分片。
+            config.hidden_size,
+            self.total_q_size,
+            self.total_kv_size,
+            bias=bias,
         )
-        self.k_proj = nn.Linear(
-            config.hidden_size, self.kv_size, bias=bias
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, self.kv_size, bias=bias
-        )
-        self.o_proj = nn.Linear(
+        self.o_proj = RowParallelLinear(
             # 输入是所有 attention heads 的输出拼接空间，输出才回到
             # token 的 hidden/residual 语义空间。
-            self.q_size,
+            self.total_q_size,
             config.hidden_size,
             bias=False,
         )
@@ -144,13 +290,17 @@ class Qwen2Attention(nn.Module):
         if hidden_states.ndim != 2:
             raise ValueError("Qwen2Attention 只接受 [total_tokens, hidden_size]")
         num_tokens = hidden_states.shape[0]
-        q = self.q_proj(hidden_states).view(
+        qkv = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split(
+            (self.q_size, self.kv_size, self.kv_size), dim=-1
+        )
+        q = q.view(
             num_tokens, self.num_heads, self.head_dim
         )
-        k = self.k_proj(hidden_states).view(
+        k = k.view(
             num_tokens, self.num_kv_heads, self.head_dim
         )
-        v = self.v_proj(hidden_states).view(
+        v = v.view(
             num_tokens, self.num_kv_heads, self.head_dim
         )
 
@@ -244,12 +394,18 @@ class Qwen2MLP(nn.Module):
         super().__init__()
         if config.hidden_act not in ("silu", "swish"):
             raise ValueError(f"暂不支持激活函数 {config.hidden_act}")
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gate_up_proj = MergedColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
+            bias=False,
+        )
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size, config.hidden_size, bias=False
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
 
 
 class Qwen2DecoderLayer(nn.Module):
@@ -275,37 +431,64 @@ class Qwen2DecoderLayer(nn.Module):
 class Qwen2Model(nn.Module):
     def __init__(self, config: Qwen2Config):
         super().__init__()
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(
-            Qwen2DecoderLayer(config) for _ in range(config.num_hidden_layers)
+        self.pp_rank = get_pipeline_model_parallel_rank()
+        self.pp_size = get_pipeline_model_parallel_world_size()
+        self.start_layer = config.num_hidden_layers * self.pp_rank // self.pp_size
+        self.end_layer = (
+            config.num_hidden_layers * (self.pp_rank + 1) // self.pp_size
         )
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # ModuleDict 的数字 key 会保留 HF 的 ``model.layers.<global_idx>`` 名字，
+        # 同时不为不属于本 stage 的 layer 建立任何参数。
+        self.layers = nn.ModuleDict(
+            {
+                str(index): Qwen2DecoderLayer(config)
+                for index in range(self.start_layer, self.end_layer)
+            }
+        )
+        self.embed_tokens = (
+            VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+            if is_pipeline_first_stage()
+            else None
+        )
+        self.norm = (
+            RMSNorm(config.hidden_size, config.rms_norm_eps)
+            if is_pipeline_last_stage()
+            else None
+        )
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor | None = None,
         attention_metadata: FullAttentionMetadataCollection | None = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if input_ids.ndim != 1:
-            raise ValueError("Qwen2Model 只接受扁平 input_ids: [total_num_tokens]")
+        if is_pipeline_first_stage():
+            if input_ids is None or input_ids.ndim != 1:
+                raise ValueError("第一个 PP stage 需要扁平 input_ids")
+            assert self.embed_tokens is not None
+            hidden_states = self.embed_tokens(input_ids)
+        elif hidden_states is None or hidden_states.ndim != 2:
+            raise ValueError("非首 PP stage 需要 [total_tokens, hidden_size] activation")
+        assert hidden_states is not None
         if positions is None:
             positions = torch.arange(
-                input_ids.shape[0], device=input_ids.device, dtype=torch.int64
+                hidden_states.shape[0], device=hidden_states.device, dtype=torch.int64
             )
-        if positions.shape != input_ids.shape:
-            raise ValueError("positions 必须与 input_ids 形状一致")
-        hidden_states = self.embed_tokens(input_ids)
-        for index, layer in enumerate(self.layers):
+        if positions.ndim != 1 or positions.shape[0] != hidden_states.shape[0]:
+            raise ValueError("positions 必须与扁平 token/activation 数量一致")
+        for global_index, layer in self.layers.items():
             layer_metadata = (
                 None
                 if attention_metadata is None
                 else attention_metadata.for_layer(
-                    f"model.layers.{index}.self_attn"
+                    f"model.layers.{global_index}.self_attn"
                 )
             )
             hidden_states = layer(hidden_states, positions, layer_metadata)
-        return self.norm(hidden_states)
+        if self.norm is not None:
+            hidden_states = self.norm(hidden_states)
+        return hidden_states
 
 
 class Qwen2ForCausalLM(nn.Module):
@@ -313,25 +496,38 @@ class Qwen2ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.model = Qwen2Model(config)
+        if config.tie_word_embeddings and get_pipeline_model_parallel_world_size() > 1:
+            raise NotImplementedError("PP>1 暂不支持跨 stage tied embeddings")
+        self.lm_head = (
+            ParallelLMHead(config.hidden_size, config.vocab_size)
+            if is_pipeline_last_stage()
+            else None
+        )
         if config.tie_word_embeddings:
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            assert self.lm_head is not None and self.model.embed_tokens is not None
             self.lm_head.weight = self.model.embed_tokens.weight
-        else:
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor | None = None,
         attention_metadata: FullAttentionMetadataCollection | None = None,
+        hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # 与 vLLM 模型接口一致：forward 返回 hidden states，logits 单独计算，
         # 避免为 batch 内每个 token 都物化 vocab-size logits。
-        return self.model(input_ids, positions, attention_metadata)
+        return self.model(
+            input_ids,
+            positions,
+            attention_metadata,
+            hidden_states=hidden_states,
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.lm_head is None:
+            raise RuntimeError("只有最后一个 PP stage 能计算 logits")
         return self.lm_head(hidden_states)
 
     def attention_layers(self):
-        for index, layer in enumerate(self.model.layers):
-            yield f"model.layers.{index}.self_attn", layer.self_attn
+        for global_index, layer in self.model.layers.items():
+            yield f"model.layers.{global_index}.self_attn", layer.self_attn

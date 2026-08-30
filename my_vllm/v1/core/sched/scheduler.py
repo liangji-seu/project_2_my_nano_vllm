@@ -413,4 +413,7 @@ class Scheduler:
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed,
             num_scheduled_tokens=num_scheduled,
+            # 【同步 PP token 回流】上一步由最后 stage 采样、经 EngineCore
+            # 更新到 Request 后，在下一 SchedulerOutput 中广播给全部 stage。
+            output_token_ids=[list(r.output_token_ids) for r in scheduled_running_reqs],
         )

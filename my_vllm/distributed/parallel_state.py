@@ -178,6 +178,33 @@ def tensor_model_parallel_all_reduce(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def tensor_model_parallel_all_gather(
+    tensor: torch.Tensor,
+    *,
+    dim: int = -1,
+) -> torch.Tensor:
+    """沿 ``dim`` 收集 TP rank 的局部张量，并按 rank 顺序拼接。
+
+    ParallelLMHead 使用它把各 rank 的局部 vocabulary logits 恢复成完整
+    vocabulary。学习版本优先保证采样语义完全正确；后续可以进一步实现
+    distributed argmax，避免物化完整 logits。
+    """
+
+    if _TP is None:
+        return tensor
+    shards = [torch.empty_like(tensor) for _ in range(_TP_SIZE)]
+    dist.all_gather(shards, tensor.contiguous(), group=_TP)
+    return torch.cat(shards, dim=dim)
+
+
+def is_pipeline_first_stage() -> bool:
+    return _PP_RANK == 0
+
+
+def is_pipeline_last_stage() -> bool:
+    return _PP_RANK == _PP_SIZE - 1
+
+
 def get_pipeline_model_parallel_prev_rank() -> int | None:
     """返回同一 TP lane 上的前一 PP stage 全局 rank。"""
     if _PP_RANK == 0:
@@ -199,12 +226,32 @@ def pipeline_model_parallel_send(tensor: torch.Tensor) -> None:
         dist.send(tensor.contiguous(), dst=destination)
 
 
+def pipeline_model_parallel_isend(tensor: torch.Tensor):
+    """异步发送 activation；调用方必须保活 tensor 并在复用前 wait。"""
+
+    destination = get_pipeline_model_parallel_next_rank()
+    if destination is None:
+        return None
+    if not tensor.is_contiguous():
+        raise ValueError("PP isend tensor 必须 contiguous，调用方负责保活发送 buffer")
+    return dist.isend(tensor, dst=destination)
+
+
 def pipeline_model_parallel_recv(tensor: torch.Tensor) -> torch.Tensor:
     """从同一 TP lane 的上一 PP stage 原地接收 activation。"""
     source = get_pipeline_model_parallel_prev_rank()
     if source is not None:
         dist.recv(tensor, src=source)
     return tensor
+
+
+def pipeline_model_parallel_irecv(tensor: torch.Tensor):
+    """异步接收 activation；真正消费 tensor 前必须 wait。"""
+
+    source = get_pipeline_model_parallel_prev_rank()
+    if source is None:
+        return None
+    return dist.irecv(tensor, src=source)
 
 
 def destroy_model_parallel() -> None:

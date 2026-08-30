@@ -8,7 +8,8 @@ ModelRunnerOutput，再由 Scheduler.update_from_output() 消费。
 
 简化说明（相比 vLLM）：
   - NewRequestData 保留 sampling_params 和完整 token 快照；去掉 LoRA / 多模态等字段。
-  - CachedRequestData 去掉投机解码、PP 的 new_token_ids 等。
+  - CachedRequestData 保留同步 PP 所需的完整 output token 快照；最后 stage
+    的采样结果先回到 Scheduler，再随下一轮 SchedulerOutput 同步到所有 stage。
   - SchedulerOutput 去掉 encoder / spec decode / KV connector 等字段。
   - ModelRunnerOutput 从 vllm/v1/outputs.py 挪到这里，只保留采样 token。
 """
@@ -40,10 +41,11 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]  # 本轮新增 block id（None 表示无新增）
     num_computed_tokens: list[int]
     num_scheduled_tokens: list[int]
+    output_token_ids: list[list[int]] = field(default_factory=list)
 
     @classmethod
     def make_empty(cls) -> "CachedRequestData":
-        return cls([], [], [], [])
+        return cls([], [], [], [], [])
 
 
 @dataclass

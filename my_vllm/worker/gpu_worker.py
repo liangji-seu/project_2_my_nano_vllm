@@ -200,12 +200,13 @@ class Worker(WorkerBase):
         torch.cuda.empty_cache()
         return available
 
-    def initialize_from_config(self, kv_cache_config):
+    def initialize_from_config(self, kv_cache_configs):
         """【Worker 初始化 · 阶段 3/3】Initialize KV Cache
 
         由 EngineCore 通过 collective_rpc 触发，为每个 worker 分配 KV cache 显存。
         按 EngineCore 计算出的物理布局真实分配、reshape 并绑定到 attention layer。
         """
+        kv_cache_config = kv_cache_configs[self.rank]
         self.num_gpu_blocks = kv_cache_config.num_blocks
         self.model_runner.initialize_kv_cache(kv_cache_config)
         # 【CUDA Graph Capture】KV Cache 与 Dispatcher 合法 key 库就绪后，
