@@ -60,6 +60,10 @@ class WorkerBase:
         """执行一次模型前向（推理主路径）"""
         raise NotImplementedError
 
+    def sample_tokens(self):
+        """消费最近一次 execute_model 的 GPU 状态并完成采样。"""
+        raise NotImplementedError
+
     def initialize_from_config(self, kv_cache_config):
         """【阶段 3/3】初始化 KV cache（由 EngineCore 通过 collective_rpc 触发）"""
         raise NotImplementedError

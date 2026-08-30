@@ -15,6 +15,7 @@ import queue
 import signal
 import threading
 import time
+from collections import deque
 
 import zmq
 
@@ -67,6 +68,12 @@ class EngineCore:
         from my_vllm.v1.core.sched.scheduler import Scheduler
 
         self.scheduler = Scheduler(vllm_config, self.kv_cache_manager)
+        self.batch_queue_size = (
+            vllm_config.parallel_config.pipeline_parallel_size
+            if vllm_config.parallel_config.pipeline_parallel_size > 1
+            else 1
+        )
+        self.batch_queue = deque(maxlen=self.batch_queue_size)
 
         logger.info(
             "EngineCore 初始化完成 (model=%s, max_model_len=%d)",
@@ -372,7 +379,12 @@ class EngineCoreProc(EngineCore):
             # 1) 批量接收新请求，交给调度器
             self._process_input_queue()
 
-            # 2) 调度：选出本轮要执行的请求
+            if self.batch_queue_size > 1:
+                self._step_with_batch_queue()
+                time.sleep(0.001)
+                continue
+
+            # 2) 同步路径：execute_model 与 sample_tokens 仍是两条独立 RPC。
             scheduler_output = self.scheduler.schedule()
 
             # 3) 执行：通过 executor.collective_rpc 把 scheduler_output 广播给所有
@@ -384,7 +396,8 @@ class EngineCoreProc(EngineCore):
                 scheduler_output.total_num_scheduled_tokens > 0
                 or scheduler_output.finished_req_ids
             ):
-                model_runner_output = self.model_executor.execute_model(scheduler_output)
+                self.model_executor.execute_model(scheduler_output)
+                model_runner_output = self.model_executor.sample_tokens()
                 # 调试日志：打印本轮 collective_rpc 回传的采样结果，直观确认执行器链路生效
                 sampled_text = {
                     rid: (
@@ -410,6 +423,56 @@ class EngineCoreProc(EngineCore):
             time.sleep(0.005)
 
         logger.info("EngineCore 退出主循环 (index=%d)", self.engine_index)
+
+    def _scheduler_has_work(self) -> bool:
+        return bool(
+            self.scheduler.waiting
+            or self.scheduler._finished_req_ids_to_notify
+            or any(
+                request.num_tokens > request.num_computed_tokens
+                for request in self.scheduler.running
+            )
+        )
+
+    def _step_with_batch_queue(self) -> None:
+        """【异步 PP】优先填充 batch queue，满队列后核销最老采样 Future。"""
+
+        submitted = False
+        if len(self.batch_queue) < self.batch_queue_size and self._scheduler_has_work():
+            scheduler_output = self.scheduler.schedule()
+            if (
+                scheduler_output.total_num_scheduled_tokens > 0
+                or scheduler_output.finished_req_ids
+            ):
+                exec_future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
+                sample_future = self.model_executor.sample_tokens(non_block=True)
+                self.batch_queue.appendleft(
+                    (sample_future, scheduler_output, exec_future)
+                )
+                submitted = True
+
+        # 队列尚未填满且仍有新批可发：先制造 PP 在途批次，不在这里阻塞。
+        if (
+            submitted
+            and len(self.batch_queue) < self.batch_queue_size
+            and self._scheduler_has_work()
+        ):
+            return
+        if not self.batch_queue:
+            self._send_finished_outputs()
+            return
+
+        sample_future, scheduler_output, exec_future = self.batch_queue.pop()
+        model_runner_output = sample_future.result()
+        # execute 返回 None 是正常语义；result() 在失败时会重新抛出 worker 异常。
+        exec_future.result()
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            self.scheduler.update_from_output(
+                scheduler_output, model_runner_output
+            )
+        self._send_finished_outputs()
 
     # ---- 主循环内部步骤 ----
 

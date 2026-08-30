@@ -23,6 +23,7 @@ import signal
 import threading
 import time
 import traceback
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum, auto
 from multiprocessing import Process, get_context
@@ -378,6 +379,11 @@ class MultiprocExecutor:
         self.workers: list[WorkerProcHandle] = []
         self.response_mqs: list[MessageQueue] = []
         self.rpc_broadcast_mq: MessageQueue | None = None
+        # 单 reader 线程严格按 RPC 提交顺序消费 response MQ，避免多个 Future
+        # 并发 dequeue 时把 batch A/B 的结果配错。
+        self._response_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="my_vllm_rpc_response"
+        )
 
         self._init_executor()
 
@@ -427,6 +433,7 @@ class MultiprocExecutor:
         args: tuple = (),
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
+        non_block: bool = False,
     ):
         """同步 RPC：广播 method 给所有 worker，收集回复
 
@@ -447,7 +454,23 @@ class MultiprocExecutor:
         # 1. 广播 RPC 请求
         self.rpc_broadcast_mq.enqueue((method, args, kwargs, unique_reply_rank))
 
-        # 2. 收集回复（response_mqs 已按 rank 排序）
+        if non_block:
+            return self._response_executor.submit(
+                self._collect_rpc_responses,
+                method,
+                timeout,
+                unique_reply_rank,
+            )
+        return self._collect_rpc_responses(method, timeout, unique_reply_rank)
+
+    def _collect_rpc_responses(
+        self,
+        method: str,
+        timeout: float | None,
+        unique_reply_rank: int | None,
+    ):
+        """按广播顺序收集一条 RPC 的响应；由唯一 reader 串行调用。"""
+
         response_mqs = self.response_mqs
         if unique_reply_rank is not None:
             response_mqs = [response_mqs[unique_reply_rank]]
@@ -463,12 +486,25 @@ class MultiprocExecutor:
 
     # ---- 常用 RPC 封装 ----
 
-    def execute_model(self, scheduler_output):
-        """执行模型前向（预留：由 scheduler 调用）"""
+    def execute_model(self, scheduler_output, non_block: bool = False):
+        """异步提交 forward；结果仅表示 execute RPC 是否成功。"""
         # 只有最后一个 PP stage 的第一个 TP rank 返回输出（预留 TP/PP）
         output_rank = self.world_size - self.parallel_config.tensor_parallel_size
         return self.collective_rpc(
-            "execute_model", args=(scheduler_output,), unique_reply_rank=output_rank
+            "execute_model",
+            args=(scheduler_output,),
+            unique_reply_rank=output_rank,
+            non_block=non_block,
+        )
+
+    def sample_tokens(self, non_block: bool = False):
+        """异步提交独立采样 RPC，只回收最后 PP stage 的 driver 输出。"""
+
+        output_rank = self.world_size - self.parallel_config.tensor_parallel_size
+        return self.collective_rpc(
+            "sample_tokens",
+            unique_reply_rank=output_rank,
+            non_block=non_block,
         )
 
     def get_kv_cache_specs(self) -> list:
@@ -510,6 +546,7 @@ class MultiprocExecutor:
         if self.rpc_broadcast_mq is not None:
             self.rpc_broadcast_mq.shutdown()
             self.rpc_broadcast_mq = None
+        self._response_executor.shutdown(wait=False, cancel_futures=True)
 
         logger.info("执行器已关闭")
 

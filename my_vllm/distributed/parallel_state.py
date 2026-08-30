@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 # 全局通信组（模块级单例）。vLLM 也这么做：进程内只有一份分组信息。
 _TP: ProcessGroup | None = None
 _PP: ProcessGroup | None = None
+_PP_BROADCAST: ProcessGroup | None = None
 _TP_SIZE = 1
 _PP_SIZE = 1
 _TP_RANK = 0
@@ -87,7 +88,7 @@ def init_model_parallel_group(
     - PP 组：同一 TP 位置、不同 PP stage 的 rank 归为一组
       例 TP=2, PP=2, world=4 → PP 组: [0,2] 和 [1,3]
     """
-    global _TP, _PP, _TP_SIZE, _PP_SIZE, _TP_RANK, _PP_RANK
+    global _TP, _PP, _PP_BROADCAST, _TP_SIZE, _PP_SIZE, _TP_RANK, _PP_RANK
 
     assert dist.is_initialized(), "必须先调用 init_distributed_environment()"
 
@@ -129,10 +130,17 @@ def init_model_parallel_group(
             _TP = group
 
     _PP = None
+    _PP_BROADCAST = None
     for ranks in pp_groups:
         group = dist.new_group(ranks) if pipeline_parallel_size > 1 else None
+        # 【ModelRunner V2·PP 旁路】相同成员再建一个 sibling communicator，
+        # sampled-token broadcast 不和 activation P2P 共用 NCCL communicator。
+        broadcast_group = (
+            dist.new_group(ranks) if pipeline_parallel_size > 1 else None
+        )
         if rank in ranks:
             _PP = group
+            _PP_BROADCAST = broadcast_group
 
     logger.info(
         "模型并行组初始化完成 (rank=%d, tp_rank=%d, pp_rank=%d)",
@@ -153,6 +161,10 @@ def get_tp_group() -> ProcessGroup | None:
 def get_pp_group() -> ProcessGroup | None:
     """返回本进程所在的 PP 通信组（PP=1 时为 None）"""
     return _PP
+
+
+def get_pp_broadcast_group() -> ProcessGroup | None:
+    return _PP_BROADCAST
 
 
 def get_tensor_model_parallel_world_size() -> int:
@@ -256,9 +268,10 @@ def pipeline_model_parallel_irecv(tensor: torch.Tensor):
 
 def destroy_model_parallel() -> None:
     """销毁 TP/PP 通信组（worker 关闭时调用）"""
-    global _TP, _PP, _TP_SIZE, _PP_SIZE, _TP_RANK, _PP_RANK
+    global _TP, _PP, _PP_BROADCAST, _TP_SIZE, _PP_SIZE, _TP_RANK, _PP_RANK
     _TP = None
     _PP = None
+    _PP_BROADCAST = None
     _TP_SIZE = _PP_SIZE = 1
     _TP_RANK = _PP_RANK = 0
 

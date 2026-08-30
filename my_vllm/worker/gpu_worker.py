@@ -224,6 +224,10 @@ class Worker(WorkerBase):
         """执行一次模型前向（委托 model_runner）"""
         return self.model_runner.execute_model(scheduler_output)
 
+    def sample_tokens(self):
+        """ModelRunner V2：独立采样 RPC，消费 execute_model 留下的 GPU 状态。"""
+        return self.model_runner.sample_tokens()
+
     def check_health(self) -> str:
         """健康检查（用于验证 RPC 通路是否打通）"""
         return f"ok (rank={self.rank})"

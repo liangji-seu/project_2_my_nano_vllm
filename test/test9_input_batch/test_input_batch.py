@@ -105,7 +105,8 @@ def test_model_runner_updates_persistent_batch_and_bookkeeping():
         new=[make_new("A", [10, 11]), make_new("B", [20])],
         scheduled={"A": 2, "B": 1},
     )
-    first_result = runner.execute_model(first)
+    runner.execute_model(first)
+    first_result = runner.sample_tokens()
     assert first_result.sampled_token_ids == [[ord("a")], [ord("a")]]
     assert runner.input_batch.req_ids == ["A", "B"]
     assert runner.input_batch.snapshot("A")["token_ids"] == [10, 11, ord("a")]
@@ -122,7 +123,8 @@ def test_model_runner_updates_persistent_batch_and_bookkeeping():
         scheduled={"A": 1},
         finished={"B"},
     )
-    second_result = runner.execute_model(second)
+    runner.execute_model(second)
+    second_result = runner.sample_tokens()
     assert second_result.sampled_token_ids == [[ord("b")]]
     assert set(runner.requests) == {"A"}
     assert runner.input_batch.req_ids == ["A"]
@@ -151,7 +153,8 @@ def test_chunked_prefill_samples_only_on_last_chunk_and_resume_keeps_outputs():
     )
 
     first = make_output(new=[make_new("C", [1, 2, 3, 4])], scheduled={"C": 2})
-    assert runner.execute_model(first).sampled_token_ids == [[]]
+    runner.execute_model(first)
+    assert runner.sample_tokens().sampled_token_ids == [[]]
     assert runner.requests["C"].num_computed_tokens == 2
 
     second = make_output(
@@ -163,7 +166,8 @@ def test_chunked_prefill_samples_only_on_last_chunk_and_resume_keeps_outputs():
         ),
         scheduled={"C": 2},
     )
-    assert runner.execute_model(second).sampled_token_ids == [[ord("a")]]
+    runner.execute_model(second)
+    assert runner.sample_tokens().sampled_token_ids == [[ord("a")]]
 
     # 模拟抢占后作为完整 NewRequestData 恢复；output token a 不能丢失。
     resumed = make_output(
@@ -178,7 +182,8 @@ def test_chunked_prefill_samples_only_on_last_chunk_and_resume_keeps_outputs():
         ],
         scheduled={"C": 5},
     )
-    assert runner.execute_model(resumed).sampled_token_ids == [[ord("b")]]
+    runner.execute_model(resumed)
+    assert runner.sample_tokens().sampled_token_ids == [[ord("b")]]
     assert runner.requests["C"].all_token_ids == [1, 2, 3, 4, ord("a"), ord("b")]
     assert runner.input_batch.snapshot("C")["block_ids"] == ([7, 8],)
 
@@ -228,7 +233,8 @@ def test_scheduler_runner_loop_cleans_finished_worker_state():
             scheduler_output.total_num_scheduled_tokens
             or scheduler_output.finished_req_ids
         ):
-            model_output = runner.execute_model(scheduler_output)
+            runner.execute_model(scheduler_output)
+            model_output = runner.sample_tokens()
             if scheduler_output.total_num_scheduled_tokens:
                 scheduler.update_from_output(scheduler_output, model_output)
 
@@ -281,6 +287,7 @@ def test_prepare_inputs_flattens_batch_and_computes_slot_mapping():
         scheduled={"A": 2, "B": 1},
     )
     runner.execute_model(first)
+    runner.sample_tokens()
     prepared = runner.last_prepared_inputs
     assert prepared is not None
     assert prepared.num_reqs == 2
@@ -338,6 +345,7 @@ def test_prepare_inputs_flattens_batch_and_computes_slot_mapping():
         scheduled={"B": 1},
     )
     runner.execute_model(second)
+    runner.sample_tokens()
     prepared = runner.last_prepared_inputs
     assert prepared is not None
     assert prepared.input_ids.tolist() == [ord("a")]
@@ -401,6 +409,7 @@ def test_prepare_inputs_uses_each_kv_group_block_size_for_slots():
     request = make_new("A", [1, 2, 3, 4, 5], computed=3)
     request.block_ids = ([7, 8, 9], [4, 5])
     runner.execute_model(make_output(new=[request], scheduled={"A": 2}))
+    runner.sample_tokens()
 
     prepared = runner.last_prepared_inputs
     assert prepared is not None

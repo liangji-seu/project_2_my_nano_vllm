@@ -68,6 +68,17 @@ class ModelForwardInputs:
     is_decode: bool
 
 
+@dataclass
+class ExecuteModelState:
+    """ModelRunner V2：execute_model 留在 GPU 上、由 sample_tokens 消费的状态。"""
+
+    scheduler_output: object
+    model_inputs: ModelForwardInputs | None
+    req_ids: list[str]
+    should_sample: list[bool]
+    hidden_states: torch.Tensor | None
+
+
 class GPUModelRunner:
     """持有一个 Worker rank 的模型和真实 KV Cache 张量。
 
@@ -138,6 +149,15 @@ class GPUModelRunner:
         # 【PP activation P2P】异步 send 的 Work 与源 tensor 必须一起保活，
         # 下一批开始前再 wait，语义对应 vLLM 的 delayed send-handle wait。
         self._pending_pp_send: tuple[torch.Tensor, object] | None = None
+        self.execute_model_state: ExecuteModelState | None = None
+        self.pp_token_handler = None
+        if (
+            device.type == "cuda"
+            and get_pipeline_model_parallel_world_size() > 1
+        ):
+            from my_vllm.worker.pp_utils import PPTokenHandler
+
+            self.pp_token_handler = PPTokenHandler(device)
         # 【CUDA Graph Dispatcher】构造 ModelRunner 时只创建空调度器。合法
         # (mode, BatchDescriptor) 要等 initialize_kv_cache 后才初始化。
         self.cudagraph_dispatcher = CUDAGraphDispatcher(
@@ -972,10 +992,45 @@ class GPUModelRunner:
                 req_state.output_token_ids.extend(sampled_ids)
                 self.input_batch.append_output_token_ids(req_id, sampled_ids)
 
-    def execute_model(self, scheduler_output):
-        """执行一次同步的准备输入、模型前向和 greedy sampling。"""
-        from my_vllm.v1.core.sched.output import ModelRunnerOutput
+    def _consume_delayed_pp_tokens(self) -> None:
+        """在当前 execute 开头提交 ``pp_size`` 步前的旁路采样结果。"""
 
+        if self.pp_token_handler is None or is_pipeline_last_stage():
+            return
+        pending = self.pp_token_handler.begin_step()
+        if pending is None:
+            return
+        token_ids = pending.sampled_tokens.to("cpu").tolist()
+        for req_id, should_sample, expected_len, token_id in zip(
+            pending.req_ids,
+            pending.should_sample,
+            pending.output_lengths,
+            token_ids,
+            strict=True,
+        ):
+            if not should_sample or req_id not in self.requests:
+                continue
+            req_state = self.requests[req_id]
+            if len(req_state.output_token_ids) == expected_len:
+                sampled = [int(token_id)]
+                req_state.output_token_ids.extend(sampled)
+                if self.input_batch is not None and req_id in self.input_batch.req_id_to_index:
+                    self.input_batch.append_output_token_ids(req_id, sampled)
+            elif (
+                len(req_state.output_token_ids) == expected_len + 1
+                and req_state.output_token_ids[-1] == int(token_id)
+            ):
+                # 同步 SchedulerOutput 已先回填同一个 token，旁路结果无需重复追加。
+                continue
+            else:
+                raise RuntimeError(f"请求 {req_id} 的 PP 延迟 token 状态分叉")
+
+    def execute_model(self, scheduler_output):
+        """ModelRunner V2：只做状态更新与 forward，采样由下一条 RPC 完成。"""
+
+        if self.execute_model_state is not None:
+            raise RuntimeError("上一次 execute_model_state 尚未被 sample_tokens 消费")
+        self._consume_delayed_pp_tokens()
         self._update_states(scheduler_output)
         assert self.input_batch is not None
         model_inputs: ModelForwardInputs | None = None
@@ -994,62 +1049,80 @@ class GPUModelRunner:
             >= self.requests[req_id].num_tokens
             for req_id in req_ids
         ]
+        hidden_states = None
+        if not self.is_mock_model and model_inputs is not None:
+            metadata = next(iter(model_inputs.attention_metadata.by_group.values()))
+            mode, descriptor = self.cudagraph_dispatcher.dispatch(
+                num_tokens=metadata.num_actual_tokens,
+                num_reqs=metadata.num_reqs,
+                max_seq_len=metadata.max_seq_len,
+                is_uniform_decode=model_inputs.is_decode,
+            )
+            if self.cudagraph_wrapper is not None:
+                hidden_states = self.cudagraph_wrapper(
+                    model_inputs, mode=mode, descriptor=descriptor
+                )
+            else:
+                hidden_states = self.model_forward(model_inputs)
+        self.execute_model_state = ExecuteModelState(
+            scheduler_output=scheduler_output,
+            model_inputs=model_inputs,
+            req_ids=list(req_ids),
+            should_sample=should_sample,
+            hidden_states=hidden_states,
+        )
+        return None
+
+    def sample_tokens(self):
+        """ModelRunner V2：消费最近一次 execute 的 GPU hidden state 并采样。"""
+
+        from my_vllm.v1.core.sched.output import ModelRunnerOutput
+
+        state = self.execute_model_state
+        if state is None:
+            raise RuntimeError("sample_tokens 前必须成功执行 execute_model")
+        self.execute_model_state = None
+        req_ids = state.req_ids
+        sampled_token_ids = [[] for _ in req_ids]
 
         if self.is_mock_model:
-            # CPU 架构测试保留可读、确定的 token 序列。
             sampled_token_ids = [
                 [ord("a") + len(self.requests[req_id].output_token_ids) % 26]
                 if sample
                 else []
-                for req_id, sample in zip(req_ids, should_sample, strict=True)
+                for req_id, sample in zip(req_ids, state.should_sample, strict=True)
             ]
-        else:
-            if model_inputs is None:
-                sampled_token_ids = [[] for _ in req_ids]
-            else:
-                # 【CUDA Graph Dispatch】运行期只选择已主动捕获的 entry 并
-                # replay；Prefill/混合 batch/未命中档位的 Decode 明确走 eager。
-                metadata = next(
-                    iter(model_inputs.attention_metadata.by_group.values())
-                )
-                mode, descriptor = self.cudagraph_dispatcher.dispatch(
-                    num_tokens=metadata.num_actual_tokens,
-                    num_reqs=metadata.num_reqs,
-                    max_seq_len=metadata.max_seq_len,
-                    is_uniform_decode=model_inputs.is_decode,
-                )
-                if self.cudagraph_wrapper is not None:
-                    hidden_states = self.cudagraph_wrapper(
-                        model_inputs,
-                        mode=mode,
-                        descriptor=descriptor,
-                    )
-                else:
-                    hidden_states = self.model_forward(model_inputs)
-                sample_req_indices = [
-                    index for index, sample in enumerate(should_sample) if sample
+        elif state.model_inputs is not None and is_pipeline_last_stage():
+            assert state.hidden_states is not None and self.model is not None
+            sample_req_indices = [
+                index for index, sample in enumerate(state.should_sample) if sample
+            ]
+            sampled_gpu = torch.full(
+                (len(req_ids),), -1, dtype=torch.int64, device=self.device
+            )
+            if sample_req_indices:
+                selected_indices = state.model_inputs.logits_indices[
+                    sample_req_indices
                 ]
-                sampled_token_ids = [[] for _ in req_ids]
-                # 所有最后 stage 的 TP ranks 都必须进入 ParallelLMHead 的
-                # all-gather；只有 executor 指定的 driver rank 回传 CPU token。
-                if sample_req_indices and is_pipeline_last_stage():
-                    assert self.model is not None
-                    selected_indices = model_inputs.logits_indices[
-                        sample_req_indices
-                    ]
-                    logits = self.model.compute_logits(
-                        hidden_states[selected_indices]
-                    )
-                    # baseline 只实现 greedy。argmax 后只 D2H 少量 token id，
-                    # model forward 与 FlashAttention 内部没有 host 同步。
-                    token_ids = torch.argmax(logits, dim=-1).to("cpu").tolist()
-                    for req_index, token_id in zip(
-                        sample_req_indices, token_ids, strict=True
-                    ):
-                        sampled_token_ids[req_index] = [int(token_id)]
+                logits = self.model.compute_logits(
+                    state.hidden_states[selected_indices]
+                )
+                sampled_gpu[sample_req_indices] = torch.argmax(logits, dim=-1)
+            if self.pp_token_handler is not None:
+                self.pp_token_handler.broadcast(sampled_gpu, state.should_sample)
+            token_ids = sampled_gpu.to("cpu").tolist()
+            for req_index, token_id in enumerate(token_ids):
+                if state.should_sample[req_index]:
+                    sampled_token_ids[req_index] = [int(token_id)]
+        elif self.pp_token_handler is not None:
+            self.pp_token_handler.receive(
+                req_ids,
+                state.should_sample,
+                [len(self.requests[req_id].output_token_ids) for req_id in req_ids],
+            )
 
         self._bookkeeping_after_sample(
-            scheduler_output, req_ids, sampled_token_ids
+            state.scheduler_output, req_ids, sampled_token_ids
         )
         return ModelRunnerOutput(
             req_ids=req_ids,

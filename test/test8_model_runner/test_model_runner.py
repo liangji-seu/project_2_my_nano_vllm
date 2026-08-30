@@ -195,6 +195,7 @@ def test_preprocessed_flat_inputs_run_real_tiny_qwen2(tmp_path):
     )
 
     runner.execute_model(scheduler_output)
+    runner.sample_tokens()
     assert runner.last_model_inputs is not None
     hidden_states = runner.model_forward(runner.last_model_inputs)
     sample_hidden_states = hidden_states[
@@ -251,7 +252,8 @@ def test_kv_cache_prefill_and_decode_match_dense_recomputation(tmp_path):
         total_num_scheduled_tokens=3,
         finished_req_ids=set(),
     )
-    first_output = runner.execute_model(first)
+    runner.execute_model(first)
+    first_output = runner.sample_tokens()
     assert first_output.sampled_token_ids == [[expected_first]]
 
     full_ids = prompt + [expected_first]
@@ -272,5 +274,6 @@ def test_kv_cache_prefill_and_decode_match_dense_recomputation(tmp_path):
         total_num_scheduled_tokens=1,
         finished_req_ids=set(),
     )
-    second_output = runner.execute_model(second)
+    runner.execute_model(second)
+    second_output = runner.sample_tokens()
     assert second_output.sampled_token_ids == [[expected_second]]
