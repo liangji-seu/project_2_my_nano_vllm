@@ -1017,10 +1017,12 @@ class GPUModelRunner:
                 if self.input_batch is not None and req_id in self.input_batch.req_id_to_index:
                     self.input_batch.append_output_token_ids(req_id, sampled)
             elif (
-                len(req_state.output_token_ids) == expected_len + 1
-                and req_state.output_token_ids[-1] == int(token_id)
+                len(req_state.output_token_ids) > expected_len
+                and req_state.output_token_ids[expected_len] == int(token_id)
             ):
-                # 同步 SchedulerOutput 已先回填同一个 token，旁路结果无需重复追加。
+                # SchedulerOutput 可能已经回填这枚 token，甚至在 PP>2 时又
+                # 回填了若干后续 token。旁路 token 对应的稳定位置是接收时的
+                # output 长度 expected_len，不能假设它仍是当前列表最后一项。
                 continue
             else:
                 raise RuntimeError(f"请求 {req_id} 的 PP 延迟 token 状态分叉")

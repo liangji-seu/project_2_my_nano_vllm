@@ -136,3 +136,49 @@ stage 0 的跨 NUMA TP 链路成为流水线瓶颈，stage 1 存在明显 bubble
 | `1,2,0,3` | 66.6008 s | 492.01 tok/s | 8,301.32 ms | 9,558.23 ms |
 
 第一种映射的输出吞吐高约 0.97%，故保留为本机记录结果。该差异较小，不能据此泛化到具有 NVLink 或对称 NUMA 拓扑的服务器。
+
+## TP=1 / PP=4 对照实验
+
+保持模型、请求、并发、token budget、显存利用率、warmup、prefix cache 和 CUDA Graph 开关全部一致，只把并行配置改为 TP=1、PP=4。物理卡顺序为 `GPU0 → GPU1 → GPU2 → GPU3`，每个 stage 持有连续 7 层，异步 batch queue 深度为 4。
+
+### PP 深度状态校验修复
+
+首次正式 PP=4 warmup 暴露了延迟 token 校验只适用于 PP=2 的问题：旧逻辑假设旁路 token 被消费时，本地 output 最多只比接收时多一项，并检查列表最后一个 token。PP=4 延迟四步消费时，SchedulerOutput 可能已经同步回填该 token 及多个后续 token，因此旧 token 已不在列表末尾。
+
+修复后使用接收时的 `expected_len` 作为稳定位置：若本地 output 已经更长，则校验 `output_token_ids[expected_len]` 是否等于延迟 token。新增 PP>2 专项回归测试后，完整测试集为 25 passed。失败的首次压测未计入任何性能指标。
+
+### PP=4 显存布局
+
+| stage / GPU | 局部层 | 局部权重 | 正式区间峰值显存 |
+|---|---:|---:|---:|
+| stage 0 / GPU0 | 7 + embedding | 4.064 GiB | 26,566 MiB |
+| stage 1 / GPU1 | 7 | 3.049 GiB | 25,616 MiB |
+| stage 2 / GPU2 | 7 | 3.049 GiB | 25,616 MiB |
+| stage 3 / GPU3 | 7 + norm/lm_head | 4.064 GiB | 26,564 MiB |
+
+- 每 rank KV block：229,376 bytes。
+- 统一 KV block 数：98,102。
+- stage 0/3 的 embedding 或 lm_head 权重更多，决定了统一 KV block 数的下限。
+
+### PP=4 正式结果
+
+| 指标 | TP=2 / PP=2 | TP=1 / PP=4 | 变化 |
+|---|---:|---:|---:|
+| 总耗时 | 65.9614 s | 60.0607 s | -8.95% |
+| 请求吞吐 | 3.88 req/s | 4.26 req/s | +9.79% |
+| 输出 token 吞吐 | 496.78 tok/s | 545.58 tok/s | +9.82% |
+| prompt + output 总 token 吞吐 | 4,470.98 tok/s | 4,910.23 tok/s | +9.82% |
+| 平均 E2E latency | 8,221.96 ms | 7,492.58 ms | -8.87% |
+| P50 E2E latency | 8,197.90 ms | 7,481.29 ms | -8.74% |
+| P95 E2E latency | 9,533.01 ms | 8,457.09 ms | -11.29% |
+
+PP=4 正式计时区间的 GPU 采样：
+
+| GPU / stage | 平均利用率 | 峰值利用率 | 峰值显存 |
+|---|---:|---:|---:|
+| GPU0 / stage 0 | 99.20% | 100% | 26,566 MiB |
+| GPU1 / stage 1 | 99.75% | 100% | 25,616 MiB |
+| GPU2 / stage 2 | 99.77% | 100% | 25,616 MiB |
+| GPU3 / stage 3 | 77.17% | 100% | 26,564 MiB |
+
+在这台 GPU P2P 不可用的服务器上，TP=2 的集合通信需要经过 PCIe/主机路径；PP=4 虽然增加了流水线 stage 数和 bubble，但只传递 activation，最终输出吞吐反而提高 9.82%。这是特定硬件拓扑下的结果；在 NVLink/NVSwitch 机器上，TP=2 的相对表现可能明显改善。

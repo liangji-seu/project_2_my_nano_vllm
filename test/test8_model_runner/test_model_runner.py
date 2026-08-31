@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,7 @@ from my_vllm.v1.core.sched.output import (
 from my_vllm.v1.kv_cache_interface import FullAttentionSpec, generate_kv_cache_config
 from my_vllm.v1.request import SamplingParams
 from my_vllm.worker.gpu_model_runner import GPUModelRunner
+from my_vllm.worker.gpu_input_batch import CachedRequestState
 
 
 def tiny_hf_config(tie_word_embeddings=False):
@@ -65,6 +67,38 @@ def test_full_attention_page_size_and_layout():
     assert config.num_blocks == 10
     assert len(config.kv_cache_tensors) == 2
     assert all(t.size == spec.page_size_bytes * 10 for t in config.kv_cache_tensors)
+
+
+def test_delayed_pp_token_can_precede_multiple_synced_tokens(monkeypatch):
+    """PP>2 时，延迟 token 已不一定是本地 output 的最后一项。"""
+
+    monkeypatch.setattr(
+        "my_vllm.worker.gpu_model_runner.is_pipeline_last_stage",
+        lambda: False,
+    )
+    pending = SimpleNamespace(
+        sampled_tokens=torch.tensor([10], dtype=torch.int64),
+        req_ids=("request",),
+        should_sample=(True,),
+        output_lengths=(0,),
+    )
+    runner = object.__new__(GPUModelRunner)
+    runner.pp_token_handler = SimpleNamespace(begin_step=lambda: pending)
+    runner.input_batch = None
+    runner.requests = {
+        "request": CachedRequestState(
+            req_id="request",
+            prompt_token_ids=[1],
+            output_token_ids=[10, 11, 12],
+            sampling_params=SamplingParams(max_tokens=4),
+            block_ids=([1],),
+            num_computed_tokens=3,
+        )
+    }
+
+    runner._consume_delayed_pp_tokens()
+
+    assert runner.requests["request"].output_token_ids == [10, 11, 12]
 
 
 def test_safetensors_recursively_matches_parameter_tree(tmp_path):
