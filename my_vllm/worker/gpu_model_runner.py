@@ -83,7 +83,7 @@ class GPUModelRunner:
     """持有一个 Worker rank 的模型和真实 KV Cache 张量。
 
     接通 ``SchedulerOutput -> InputBatch -> model -> sampler -> KV cache`` 的
-    单卡同步 baseline。
+    同时服务单卡 eager 路径与 TP/PP ModelRunner V2 异步批队列路径。
     """
 
     def __init__(self, vllm_config, device: torch.device):

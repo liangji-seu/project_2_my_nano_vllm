@@ -93,6 +93,7 @@ class EngineCore:
         from my_vllm.v1.kv_cache_interface import generate_kv_cache_config
 
         worker_specs = self.model_executor.get_kv_cache_specs()
+        model_memory_per_worker = self.model_executor.get_model_memory_usage()
         available_per_worker = self.model_executor.determine_available_memory()
         # 【PP KV 配置】不同 stage 拥有不同 layer_names，不能把 rank0 的配置
         # 原样广播给所有 worker。先按每个 rank 的本地层数/页大小求容量，再取
@@ -124,7 +125,15 @@ class EngineCore:
         # 下任选一个 rank 的本地配置即可，layer_names 仅供对应 Worker 绑定。
         kv_cache_config = worker_configs[0]
         logger.info(
-            "KV cache 初始化完成：available_per_worker=%s, common_blocks=%d, ack=%s",
+            "KV cache 初始化完成：model_memory_per_worker=%s, "
+            "kv_layers_per_worker=%s, bytes_per_block_per_worker=%s, "
+            "available_per_worker=%s, common_blocks=%d, ack=%s",
+            model_memory_per_worker,
+            [len(specs) for specs in worker_specs],
+            [
+                sum(spec.page_size_bytes for spec in specs.values())
+                for specs in worker_specs
+            ],
             available_per_worker,
             kv_cache_config.num_blocks,
             results,
@@ -387,9 +396,8 @@ class EngineCoreProc(EngineCore):
             # 2) 同步路径：execute_model 与 sample_tokens 仍是两条独立 RPC。
             scheduler_output = self.scheduler.schedule()
 
-            # 3) 执行：通过 executor.collective_rpc 把 scheduler_output 广播给所有
-            #    worker，worker 执行「前向 + 采样」后回传 ModelRunnerOutput。
-            #    （worker 侧 forward 目前是 mock，见 GPUModelRunner.execute_model）
+            # 3) 执行：即使是 PP=1，也保留 ModelRunner V2 的两段式接口：
+            #    execute_model 只前向，sample_tokens 独立完成 logits/采样。
             # 即使本轮没有 token，只要有 finished 通知也必须 RPC 一次，让
             # Worker 清掉 CachedRequestState/InputBatch 槽位。
             if (

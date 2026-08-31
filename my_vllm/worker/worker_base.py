@@ -75,6 +75,10 @@ class WorkerBase:
     def get_model(self) -> nn.Module:
         raise NotImplementedError
 
+    def get_model_memory_usage(self) -> int:
+        """返回当前 rank 的局部模型权重内存占用（字节）。"""
+        raise NotImplementedError
+
     def shutdown(self) -> None:
         """清理资源（默认无操作）"""
         return

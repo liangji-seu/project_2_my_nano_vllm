@@ -1,5 +1,5 @@
 """
-多进程执行器 — 拉起 Worker 进程 + 同步 collective_rpc
+多进程执行器 — 拉起 Worker 进程 + 有序异步 collective_rpc
 
 对应 vLLM 的 vllm/v1/executor/multiproc_executor.py
 
@@ -12,8 +12,9 @@
     └─ response_mqs[rank]（reader）    ← 收集每个 worker 的回复
 
 简化说明（相比 vLLM 源码）：
-  - collective_rpc 改为「同步阻塞」：发广播 → 等所有回复 → 返回结果列表。
-    vLLM 用 FutureWrapper + futures_queue 做异步 RPC，学习项目先做同步。
+  - collective_rpc 同时支持同步等待和 ``non_block=True`` 异步提交。
+  - 异步回复由单线程严格按 RPC 广播顺序回收，避免相邻 micro-batch
+    的 response MQ 消息被不同 Future 交叉消费。
   - 省略多机 TP/PP（peer_worker_response_mqs）、DP、worker 健康监控线程等。
   - 省略 cloudpickle 字节方法分支（RPC 方法统一用字符串名）。
 """
@@ -435,9 +436,10 @@ class MultiprocExecutor:
         unique_reply_rank: int | None = None,
         non_block: bool = False,
     ):
-        """同步 RPC：广播 method 给所有 worker，收集回复
+        """广播 method 给所有 worker，可同步收集或返回 Future。
 
-        对应 vLLM 的 collective_rpc()，但简化为同步阻塞（无 Future）。
+        对应 vLLM 的 collective_rpc()。``non_block=True`` 时仅提交命令，
+        返回值由有序 response executor 在后台核销。
 
         Args:
             method:           要调用的 worker 方法名（字符串）
@@ -510,6 +512,10 @@ class MultiprocExecutor:
     def get_kv_cache_specs(self) -> list:
         """收集每个 Worker 根据本 rank 模型得到的逐层 KV 规格。"""
         return self.collective_rpc("get_kv_cache_spec")
+
+    def get_model_memory_usage(self) -> list[int]:
+        """收集每个 Worker 的局部模型权重显存占用。"""
+        return self.collective_rpc("get_model_memory_usage")
 
     def determine_available_memory(self) -> list[int]:
         """让所有 Worker 做 profiling，返回各 rank 的 KV 可用字节数。"""

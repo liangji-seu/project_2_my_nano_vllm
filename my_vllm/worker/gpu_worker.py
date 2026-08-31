@@ -150,6 +150,10 @@ class Worker(WorkerBase):
         """返回本 rank 模型逐层的 KV page 规格。"""
         return self.model_runner.get_kv_cache_spec()
 
+    def get_model_memory_usage(self) -> int:
+        """返回本 rank 实际加载的局部权重显存字节数。"""
+        return self.model_runner.model_memory_usage
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """profiling dummy forward，返回可分给 KV Cache 的字节数。"""
