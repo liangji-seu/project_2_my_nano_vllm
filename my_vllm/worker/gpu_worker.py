@@ -48,6 +48,9 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+from my_vllm.worker.gpu_memory import calculate_available_kv_cache_memory
+
+
 class Worker(WorkerBase):
     """GPU Worker — 每个 GPU 进程一个实例
 
@@ -97,10 +100,12 @@ class Worker(WorkerBase):
         # + dummy forward 峰值」都从总预算中扣除。
         if self.device.type == "cuda":
             free_memory, total_memory = torch.cuda.mem_get_info(self.device)
+            reserved_baseline = torch.cuda.memory_reserved(self.device)
         else:
-            free_memory = total_memory = 0
+            free_memory = total_memory = reserved_baseline = 0
         self.init_free_memory = free_memory
         self.total_memory = total_memory
+        self.init_torch_memory_reserved = reserved_baseline
 
         # 5. 构造 model_runner（本阶段已实现加载/profiling/KV，InputBatch 后续接入）
         from my_vllm.worker.gpu_model_runner import GPUModelRunner
@@ -156,52 +161,70 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
-        """profiling dummy forward，返回可分给 KV Cache 的字节数。"""
+        """Profile the model and return a conservative KV-cache byte budget."""
         if self.model_runner.is_mock_model:
             specs = self.model_runner.get_kv_cache_spec()
             blocks = self.vllm_config.num_gpu_blocks or 1024
             return blocks * sum(spec.page_size_bytes for spec in specs.values())
         if self.device.type != "cuda":
-            raise RuntimeError("真实模型 profiling 需要 CUDA GPU")
+            raise RuntimeError("Real model profiling requires a CUDA GPU")
 
         utilization = self.vllm_config.gpu_memory_utilization
         if not 0 < utilization <= 1:
-            raise ValueError("gpu_memory_utilization 必须在 (0, 1] 范围内")
+            raise ValueError("gpu_memory_utilization must be in (0, 1]")
 
         gc.collect()
         torch.cuda.empty_cache()
-        free_after_load, _ = torch.cuda.mem_get_info(self.device)
+        reserved_before_profile = torch.cuda.memory_reserved(self.device)
         torch.cuda.reset_peak_memory_stats(self.device)
         allocated_before_profile = torch.cuda.memory_allocated(self.device)
         self.model_runner.profile_run()
         peak_allocated = torch.cuda.max_memory_allocated(self.device)
         activation_peak = max(0, peak_allocated - allocated_before_profile)
 
-        requested_memory = int(self.total_memory * utilization)
-        memory_used_before_profile = self.total_memory - free_after_load
-        non_kv_cache_memory = memory_used_before_profile + activation_peak
-        available = requested_memory - non_kv_cache_memory
-        manual = self.vllm_config.kv_cache_memory_bytes
-        if manual is not None:
-            available = manual
-        if available <= 0:
-            raise MemoryError(
-                "profiling 后没有可用 KV cache 显存："
-                f"total={self.total_memory}, utilization={utilization}, "
-                f"used_before_profile={memory_used_before_profile}, "
-                f"activation_peak={activation_peak}, available={available}"
-            )
-        logger.info(
-            "显存 profiling：total=%.2f GiB, requested=%.2f GiB, "
-            "weights=%.2f GiB, activation_peak=%.2f GiB, available_kv=%.2f GiB",
-            self.total_memory / 1024**3,
-            requested_memory / 1024**3,
-            self.model_runner.model_memory_usage / 1024**3,
-            activation_peak / 1024**3,
-            available / 1024**3,
-        )
+        # Release profiling tensors/cache before measuring the physical cap.
         gc.collect()
         torch.cuda.empty_cache()
+        free_after_profile, _ = torch.cuda.mem_get_info(self.device)
+
+        available = calculate_available_kv_cache_memory(
+            initial_free_memory=self.init_free_memory,
+            utilization=utilization,
+            reserved_baseline=self.init_torch_memory_reserved,
+            reserved_before_profile=reserved_before_profile,
+            activation_peak=activation_peak,
+            free_after_profile=free_after_profile,
+        )
+        manual = self.vllm_config.kv_cache_memory_bytes
+        if manual is not None:
+            available = min(manual, free_after_profile - activation_peak)
+        requested_memory = int(self.init_free_memory * utilization)
+        worker_torch_growth = max(
+            0, reserved_before_profile - self.init_torch_memory_reserved
+        )
+        if available <= 0:
+            raise MemoryError(
+                "Profiling leaves no KV cache memory: "
+                f"initial_free={self.init_free_memory}, "
+                f"utilization={utilization}, "
+                f"worker_torch_growth={worker_torch_growth}, "
+                f"activation_peak={activation_peak}, "
+                f"free_after_profile={free_after_profile}, "
+                f"available={available}"
+            )
+        logger.info(
+            "KV-cache profiling: initial_free=%.2f GiB, requested=%.2f GiB, "
+            "weights=%.2f GiB, worker_torch_growth=%.2f GiB, "
+            "activation_peak=%.2f GiB, free_after_profile=%.2f GiB, "
+            "available_kv=%.2f GiB",
+            self.init_free_memory / 1024**3,
+            requested_memory / 1024**3,
+            self.model_runner.model_memory_usage / 1024**3,
+            worker_torch_growth / 1024**3,
+            activation_peak / 1024**3,
+            free_after_profile / 1024**3,
+            available / 1024**3,
+        )
         return available
 
     def initialize_from_config(self, kv_cache_configs):

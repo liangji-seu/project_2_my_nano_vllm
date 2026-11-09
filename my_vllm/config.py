@@ -5,7 +5,9 @@
 """
 
 import argparse
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -49,6 +51,27 @@ class ParallelConfig:
         return self.world_size
 
 
+def read_model_context_limit(model: str) -> int | None:
+    config_path = Path(model).expanduser() / "config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        with config_path.open(encoding="utf-8") as file:
+            model_config = json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read model config {config_path}: {exc}") from exc
+    if not isinstance(model_config, dict):
+        raise ValueError(f"model config {config_path} must contain a JSON object")
+    if "max_position_embeddings" not in model_config:
+        return None
+    limit = model_config["max_position_embeddings"]
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError(
+            f"{config_path}: max_position_embeddings must be a positive integer, got {limit!r}"
+        )
+    return limit
+
+
 @dataclass
 class EngineConfig:
     """引擎配置 — 从 CLI 参数构造"""
@@ -58,7 +81,10 @@ class EngineConfig:
     model: str = "test-model"
     disable_log_stats: bool = False
     served_model_name: str | None = None
+    # Direct dataclass construction keeps the historical 4096 default; CLI construction resolves an integer first.
     max_model_len: int = 4096
+    model_context_limit: int | None = None
+    max_model_len_source: str = "dataclass"
     data_parallel_size: int = 1  # DP 并行度（引擎后端进程数）
     enable_log_requests: bool = False
     seed: int = 0  # 随机种子，保证推理链的确定性
@@ -92,13 +118,44 @@ class EngineConfig:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "EngineConfig":
+        model_context_limit = read_model_context_limit(args.model)
+        requested_max_model_len = getattr(args, "max_model_len", None)
+        if requested_max_model_len is None:
+            if model_context_limit is None:
+                raise ValueError(
+                    f"cannot resolve max_model_len from {Path(args.model).expanduser() / 'config.json'} "
+                    "(missing config or max_position_embeddings); specify --max-model-len explicitly"
+                )
+            max_model_len = model_context_limit
+            max_model_len_source = "auto"
+        else:
+            if (
+                isinstance(requested_max_model_len, bool)
+                or not isinstance(requested_max_model_len, int)
+                or requested_max_model_len <= 0
+            ):
+                raise ValueError(
+                    f"--max-model-len must be a positive integer, got {requested_max_model_len!r}"
+                )
+            if (
+                model_context_limit is not None
+                and requested_max_model_len > model_context_limit
+            ):
+                raise ValueError(
+                    f"--max-model-len={requested_max_model_len} exceeds model "
+                    f"max_position_embeddings={model_context_limit}"
+                )
+            max_model_len = requested_max_model_len
+            max_model_len_source = "explicit"
         return cls(
             host=args.host,
             port=args.port,
             model=args.model,
             disable_log_stats=args.disable_log_stats,
             served_model_name=args.served_model_name,
-            max_model_len=args.max_model_len,
+            max_model_len=max_model_len,
+            model_context_limit=model_context_limit,
+            max_model_len_source=max_model_len_source,
             data_parallel_size=getattr(args, "dp_size", 1),
             enable_log_requests=getattr(args, "enable_log_requests", False),
             seed=getattr(args, "seed", 0),
@@ -167,8 +224,8 @@ def make_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-model-len",
         type=int,
-        default=4096,
-        help="模型最大上下文长度",
+        default=None,
+        help="模型最大上下文长度；默认从模型 config.json 自动读取",
     )
     parser.add_argument(
         "--enable-log-requests",
@@ -215,7 +272,7 @@ def make_arg_parser() -> argparse.ArgumentParser:
         "--gpu-memory-utilization",
         type=float,
         default=0.9,
-        help="单个 Worker 可使用的 GPU 总显存比例",
+        help="Fraction of worker-initialization free GPU memory to budget for model/runtime and KV cache.",
     )
     parser.add_argument(
         "--kv-cache-memory-bytes",

@@ -99,6 +99,24 @@ async def init_app_state(
     """
     vllm_config = engine_client.vllm_config
 
+    try:
+        from transformers import AutoTokenizer
+
+        chat_tokenizer = AutoTokenizer.from_pretrained(
+            args.model,
+            local_files_only=True,
+            trust_remote_code=False,
+            use_fast=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"could not load local chat tokenizer for {args.model!r}; "
+            "chat completions require a cached tokenizer with a chat template"
+        ) from exc
+    if not getattr(chat_tokenizer, "chat_template", None):
+        raise RuntimeError(f"model {args.model!r} has no chat_template")
+
+    state.chat_tokenizer = chat_tokenizer
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
     state.vllm_config = vllm_config
@@ -126,6 +144,12 @@ async def run_server(args: Namespace) -> None:
 
     # 2. 构造引擎配置
     vllm_config = EngineConfig.from_cli_args(args)
+    logger.info(
+        "model_context_limit=%s resolved_max_model_len=%d source=%s",
+        vllm_config.model_context_limit,
+        vllm_config.max_model_len,
+        vllm_config.max_model_len_source,
+    )
 
     # 3. 构造引擎前端（创建 ZMQ sockets + 启动引擎进程）
     engine_client = AsyncLLM(vllm_config=vllm_config)

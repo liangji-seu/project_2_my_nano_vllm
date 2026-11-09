@@ -91,6 +91,27 @@ class BenchmarkMatrixTests(unittest.TestCase):
         self.assertEqual(len([x for x in results if x["error"]]), 2)
         self.assertTrue(all(x["latency_ms"] is not None for x in results))
 
+    def test_warmup_failure_reports_cause_and_skips_measurement(self):
+        MockHandler.calls = 1  # The next request deliberately returns HTTP 500.
+        server = ThreadingHTTPServer(("127.0.0.1", 0), MockHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            rows = [{"content": "hello", "source_id": "warmup-0",
+                     "input_tokens": 2, "prompt_hash": "hash"}]
+            with self.assertRaisesRegex(RuntimeError, "HTTP 500") as failure:
+                bm.run_requests(
+                    f"http://127.0.0.1:{server.server_port}", "fake", rows,
+                    8, 1, 3, FakeTokenizer(), warmup=1,
+                )
+            self.assertIn("/v1/chat/completions", str(failure.exception))
+            self.assertIn("source_id=warmup-0", str(failure.exception))
+            self.assertEqual(MockHandler.calls, 2)
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+
     def test_output_files_schema(self):
         with TemporaryDirectory() as tmp:
             args = type("Args", (), {"output_dir": tmp})()

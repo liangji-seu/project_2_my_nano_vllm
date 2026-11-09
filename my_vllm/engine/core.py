@@ -20,8 +20,14 @@ from collections import deque
 import zmq
 
 from my_vllm.config import EngineConfig
+from my_vllm.engine.output_details import (
+    get_termination_cause,
+    should_log_stream_update,
+)
 
 logger = logging.getLogger(__name__)
+STREAM_LOG_EVERY_TOKENS = 16
+STREAM_LOG_INTERVAL_SECONDS = 0.25
 
 
 class EngineCore:
@@ -68,6 +74,7 @@ class EngineCore:
         from my_vllm.v1.core.sched.scheduler import Scheduler
 
         self.scheduler = Scheduler(vllm_config, self.kv_cache_manager)
+        self._streamed_text: dict[str, tuple[int, str, float]] = {}
         self.batch_queue_size = (
             vllm_config.parallel_config.pipeline_parallel_size
             if vllm_config.parallel_config.pipeline_parallel_size > 1
@@ -407,22 +414,49 @@ class EngineCoreProc(EngineCore):
                 self.model_executor.execute_model(scheduler_output)
                 model_runner_output = self.model_executor.sample_tokens()
                 # 调试日志：打印本轮 collective_rpc 回传的采样结果，直观确认执行器链路生效
-                sampled_text = {
-                    rid: (
-                        self.tokenizer.decode(ids)
-                        if self.tokenizer is not None
-                        else "".join(chr(t) for t in ids)
-                    )
-                    for rid, ids in zip(
-                        model_runner_output.req_ids,
-                        model_runner_output.sampled_token_ids,
-                    )
-                }
-                logger.info("[RPC] execute_model 本轮采样结果: %s", sampled_text)
                 if scheduler_output.total_num_scheduled_tokens > 0:
                     self.scheduler.update_from_output(
                         scheduler_output, model_runner_output
                     )
+                    for req_id in model_runner_output.req_ids:
+                        request = self.scheduler.requests.get(req_id)
+                        if request is None:
+                            continue
+                        output_count = request.num_output_tokens
+                        previous_count, previous_text, previous_log_time = (
+                            self._streamed_text.get(req_id, (0, "", 0.0))
+                        )
+                        now = time.monotonic()
+                        if not should_log_stream_update(
+                            output_count,
+                            previous_count,
+                            previous_log_time,
+                            now,
+                            request.is_finished(),
+                            every_tokens=STREAM_LOG_EVERY_TOKENS,
+                            interval_seconds=STREAM_LOG_INTERVAL_SECONDS,
+                        ):
+                            continue
+                        cumulative_text = self._detokenize(request.output_token_ids)
+                        reset = not cumulative_text.startswith(previous_text)
+                        delta = (
+                            cumulative_text
+                            if reset
+                            else cumulative_text[len(previous_text):]
+                        )
+                        logger.info(
+                            "request_id=%s stream step=%d output_tokens=%d delta=%r reset=%s final_flush=False",
+                            req_id,
+                            output_count,
+                            output_count,
+                            delta,
+                            reset,
+                        )
+                        self._streamed_text[req_id] = (
+                            output_count,
+                            cumulative_text,
+                            now,
+                        )
 
             # 4) 回传已结束请求的输出
             self._send_finished_outputs()
@@ -502,10 +536,15 @@ class EngineCoreProc(EngineCore):
         from my_vllm.v1.request import Request, SamplingParams
 
         prompt = raw.get("prompt", "")
+        supplied_token_ids = raw.get("prompt_token_ids")
         prompt_token_ids = (
-            self.tokenizer.encode(prompt)
-            if self.tokenizer is not None
-            else [ord(ch) for ch in prompt]
+            [int(token_id) for token_id in supplied_token_ids]
+            if supplied_token_ids is not None
+            else (
+                self.tokenizer.encode(prompt)
+                if self.tokenizer is not None
+                else [ord(ch) for ch in prompt]
+            )
         )
         max_tokens = raw.get("max_tokens", self.vllm_config.max_model_len)
         return Request(
@@ -522,11 +561,6 @@ class EngineCoreProc(EngineCore):
         )
 
     def _send_finished_outputs(self) -> None:
-        """把本步判定结束的请求结果送回 output_queue → 前端
-
-        finish_reason 取 Request.get_finished_reason()；detokenize 用字符级解码
-        （与 _build_request 的字符级编码对应，真实实现替换为 tokenizer.decode()）。
-        """
         for req_id in list(self.scheduler.finished_req_ids):
             request = self.scheduler.requests.get(req_id)
             self.scheduler.finished_req_ids.discard(req_id)
@@ -534,17 +568,52 @@ class EngineCoreProc(EngineCore):
                 continue
 
             finish_reason = request.get_finished_reason()
+            finish_value = finish_reason.value if finish_reason else "unknown"
+            eos_reached = bool(
+                self.tokenizer is not None
+                and request.output_token_ids
+                and request.output_token_ids[-1] in self.tokenizer.eos_token_ids
+            )
+            logged_count, logged_text, _ = self._streamed_text.get(
+                req_id, (0, "", 0.0)
+            )
+            if request.num_output_tokens > logged_count:
+                final_text = self._detokenize(request.output_token_ids)
+                reset = not final_text.startswith(logged_text)
+                delta = final_text if reset else final_text[len(logged_text):]
+                logger.info(
+                    "request_id=%s stream step=%d output_tokens=%d delta=%r reset=%s final_flush=True",
+                    req_id,
+                    request.num_output_tokens,
+                    request.num_output_tokens,
+                    delta,
+                    reset,
+                )
+            elif logged_count:
+                final_text = logged_text
+            else:
+                final_text = self._detokenize(request.output_token_ids)
             output = {
                 "request_id": req_id,
-                "text": self._detokenize(request.output_token_ids),
-                "finish_reason": finish_reason.value if finish_reason else "stop",
+                "text": final_text,
+                "prompt_tokens": request.num_prompt_tokens,
+                "completion_tokens": request.num_output_tokens,
+                "total_tokens": request.num_tokens,
+                "finish_reason": finish_value,
+                "max_tokens": request.max_tokens,
+                "max_model_len": self.vllm_config.max_model_len,
+                "termination_cause": get_termination_cause(
+                    finish_value,
+                    request.num_prompt_tokens,
+                    request.num_output_tokens,
+                    request.max_tokens,
+                    self.vllm_config.max_model_len,
+                    eos_reached=eos_reached,
+                ),
             }
             self.output_queue.put(output)
             self.scheduler.requests.pop(req_id, None)
-            logger.info(
-                "请求 %s 完成: finish_reason=%s, output_tokens=%d",
-                req_id, finish_reason, request.num_output_tokens,
-            )
+            self._streamed_text.pop(req_id, None)
 
     def _detokenize(self, token_ids: list[int]) -> str:
         if self.tokenizer is not None:

@@ -242,7 +242,7 @@ class MPClient:
         # _pending_requests: request_id → Future
         # generate() 发送请求后创建一个 Future,
         # _process_outputs() 收到输出后 resolve
-        self._pending_requests: dict[str, asyncio.Future[str]] = {}
+        self._pending_requests: dict[str, asyncio.Future[dict[str, object]]] = {}
 
         # ---- 状态 ----
         self._started = False
@@ -308,7 +308,7 @@ class MPClient:
 
                 future = self._pending_requests.pop(request_id, None)
                 if future is not None and not future.done():
-                    future.set_result(output["text"])
+                    future.set_result(output)
                 else:
                     logger.warning(
                         "收到未知 request_id 的输出: %s", request_id
@@ -321,47 +321,35 @@ class MPClient:
     # ---- 推理接口 ----
 
     async def generate(self, prompt: str, max_tokens: int = 100) -> str:
-        """发送推理请求到引擎后端, 等待返回结果
+        result = await self.generate_with_details(prompt, max_tokens=max_tokens)
+        return str(result["text"])
 
-        流程:
-          1. 生成 request_id, 创建 Future
-          2. 通过 ROUTER 发送到引擎
-          3. await Future (由 _process_outputs resolve)
-
-        Args:
-            prompt: 文本 prompt（后续扩展为完整的 EngineCoreRequest）
-            max_tokens: 最大生成 token 数
-
-        Returns:
-            引擎生成的文本
-        """
+    async def generate_with_details(
+        self,
+        prompt: str,
+        max_tokens: int = 100,
+        *,
+        prompt_token_ids: list[int] | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, object]:
         if not self._started:
-            raise RuntimeError("MPClient 尚未启动, 请先调用 start()")
+            raise RuntimeError("MPClient is not started; call start() first")
 
-        request_id = uuid.uuid4().hex
+        request_id = request_id or uuid.uuid4().hex
         request = {
             "request_id": request_id,
             "prompt": prompt,
+            "prompt_token_ids": prompt_token_ids,
             "max_tokens": max_tokens,
         }
-
-        # 创建 Future 用于等待结果
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[str] = loop.create_future()
+        future: asyncio.Future[dict[str, object]] = loop.create_future()
         self._pending_requests[request_id] = future
-
-        # 通过 ROUTER 发送到引擎（发送给第一个引擎）
-        # ROUTER.send_multipart([identity, json_data])
-        #   → DEALER 收到: [json_data]  (identity 被自动 strip)
         identity = self._engine_identities[0]
         await self._input_socket.send_multipart(
             [identity, json.dumps(request).encode()]
         )
-        logger.info(
-            "已发送请求: request_id=%s, prompt=%.40s...", request_id, prompt
-        )
-
-        # 等待引擎返回结果
+        logger.info("request_id=%s queued for EngineCore", request_id)
         return await future
 
     # ---- 关闭 ----

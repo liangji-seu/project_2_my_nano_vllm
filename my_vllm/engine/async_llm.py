@@ -117,37 +117,34 @@ class AsyncLLM:
         max_tokens: int = 100,
         temperature: float = 0.0,
     ) -> str:
-        """通过 ZMQ 发送推理请求到引擎后端, 等待返回结果
+        result = await self.generate_with_details(
+            prompt, max_tokens=max_tokens, temperature=temperature
+        )
+        return str(result["text"])
 
-        对应 vLLM AsyncLLM.generate()
-
-        流程:
-          1. 确保已启动（懒 start, 防止忘记调用 start()）
-          2. 通过 mp_client 发送 ROUTER → DEALER
-          3. 等待 PULL ← PUSH 返回结果
-
-        Args:
-            prompt:     文本 prompt
-            max_tokens: 最大生成 token 数（预留）
-            temperature: 采样温度（预留）
-
-        Returns:
-            引擎生成的文本
-        """
-        # 懒启动 — 如果还没调用 start(), 自动启动
+    async def generate_with_details(
+        self,
+        prompt: str,
+        max_tokens: int = 100,
+        temperature: float = 0.0,
+        *,
+        prompt_token_ids: list[int] | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, object]:
         if not self._started:
             await self.start()
-
-        logger.info(
-            "收到推理请求: prompt=%.50s..., max_tokens=%d",
-            prompt,
+        logger.debug(
+            "request_id=%s submitting prompt with %d tokens and max_tokens=%d",
+            request_id,
+            len(prompt_token_ids) if prompt_token_ids is not None else -1,
             max_tokens,
         )
-
-        # 通过 ZMQ 发送到引擎后端, 等待返回
-        result = await self.mp_client.generate(prompt, max_tokens=max_tokens)
-        logger.info("推理完成: result=%.50s...", result)
-        return result
+        return await self.mp_client.generate_with_details(
+            prompt,
+            max_tokens=max_tokens,
+            prompt_token_ids=prompt_token_ids,
+            request_id=request_id,
+        )
 
     # ---- 关闭 ----
 

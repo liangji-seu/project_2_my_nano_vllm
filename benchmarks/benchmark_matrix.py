@@ -167,8 +167,19 @@ def run_requests(base_url: str, model: str, workload: list[dict[str, Any]], outp
     if warmup:
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             warm = list(pool.map(lambda r: _request(base_url, model, r, output_budget, timeout), workload[:warmup]))
-        if any(x["status"] != "success" for x in warm):
-            raise RuntimeError("warmup request failed; measured case was not run")
+        failed = [result for result in warm if result["status"] != "success"]
+        if failed:
+            details = "; ".join(
+                f"source_id={result['source_id']} "
+                f"http_status={result['http_status']} error={result['error']}"
+                for result in failed[:3]
+            )
+            endpoint = base_url.rstrip("/") + "/v1/chat/completions"
+            raise RuntimeError(
+                f"warmup request failed at {endpoint}: {details}; "
+                "measured case was not run. Check that the HTTP service is ready "
+                "and inspect its startup logs."
+            )
     started = time.perf_counter()
     results = []
     with ThreadPoolExecutor(max_workers=concurrency) as pool:

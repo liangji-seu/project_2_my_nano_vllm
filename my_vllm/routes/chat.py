@@ -1,77 +1,117 @@
-"""
-OpenAI 兼容 Chat Completions 接口
-
-POST /v1/chat/completions → 通过 ZMQ 发送到引擎后端 → 返回完整回复
-
-后续 commit 实现流式 SSE（逐 token）
-"""
+# OpenAI-compatible chat completion route with request observability.
 
 import json
+import logging
 import time
+import uuid
 
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def prepare_chat_prompt(messages: list[dict], tokenizer) -> tuple[str, list[int], int]:
+    if not messages:
+        raise ValueError("messages must contain at least one message")
+    formatted_prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    prompt_token_ids = tokenizer.encode(formatted_prompt, add_special_tokens=False)
+    raw_content_tokens = 0
+    for message in messages:
+        content = message.get("content", "")
+        if not isinstance(content, str):
+            raise ValueError("only text message content is supported")
+        raw_content_tokens += len(tokenizer.encode(content, add_special_tokens=False))
+    return formatted_prompt, list(prompt_token_ids), raw_content_tokens
 
 
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    """
-    OpenAI 兼容的 /v1/chat/completions 接口
-
-    流程:
-      1. 解析请求中的 messages
-      2. 拼接成 prompt 字符串
-      3. 通过 AsyncLLM.generate() → ZMQ → 引擎后端 → 返回结果
-      4. 返回 JSON 格式响应（非流式）
-
-    后续 commit 实现:
-      - 流式 SSE（逐 token）
-      - tokenizer 预处理（apply chat template）
-    """
     body = await request.json()
     messages = body.get("messages", [])
     model = body.get("model", request.app.state.served_model_name)
     max_tokens = body.get("max_tokens", 100)
+    request_id = uuid.uuid4().hex
 
-    # 提取用户消息拼接为 prompt
-    # 后续 commit: 使用 tokenizer.apply_chat_template()
-    prompt_parts = []
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        prompt_parts.append(f"[{role}]: {content}")
-    prompt = "\n".join(prompt_parts)
+    try:
+        prompt, prompt_token_ids, raw_content_tokens = prepare_chat_prompt(
+            messages, request.app.state.chat_tokenizer
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("request_id=%s chat template rendering failed", request_id)
+        raise HTTPException(status_code=500, detail="chat template rendering failed") from exc
 
-    # 通过引擎前端发送推理请求
-    engine_client = request.app.state.engine_client
-    generated_text = await engine_client.generate(
-        prompt=prompt,
-        max_tokens=max_tokens,
+    max_model_len = request.app.state.vllm_config.max_model_len
+    logger.info(
+        "request_id=%s raw_messages=%s raw_content_tokens=%d",
+        request_id,
+        json.dumps(messages, ensure_ascii=False, separators=(",", ":")),
+        raw_content_tokens,
+    )
+    logger.info(
+        "request_id=%s formatted_prompt=%s input_tokens=%d max_tokens=%d max_model_len=%d",
+        request_id,
+        prompt,
+        len(prompt_token_ids),
+        max_tokens,
+        max_model_len,
+    )
+    if len(prompt_token_ids) >= max_model_len:
+        raise HTTPException(
+            status_code=400,
+            detail=f"formatted prompt has {len(prompt_token_ids)} tokens; max_model_len={max_model_len} leaves no room for generation",
+        )
+
+    try:
+        result = await request.app.state.engine_client.generate_with_details(
+            prompt=prompt,
+            prompt_token_ids=prompt_token_ids,
+            max_tokens=max_tokens,
+            request_id=request_id,
+        )
+    except Exception:
+        logger.exception("request_id=%s generation failed", request_id)
+        raise
+
+    generated_text = result["text"]
+    prompt_tokens = result["prompt_tokens"]
+    completion_tokens = result["completion_tokens"]
+    total_tokens = result["total_tokens"]
+    finish_reason = result["finish_reason"]
+    logger.info(
+        "request_id=%s final_text=%s prompt_tokens=%d output_tokens=%d total_tokens=%d finish_reason=%s termination_cause=%s max_tokens=%d max_model_len=%d",
+        request_id,
+        generated_text,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        finish_reason,
+        result["termination_cause"],
+        result["max_tokens"],
+        result["max_model_len"],
     )
 
-    # 构造 OpenAI 兼容响应
-    chat_id = f"chatcmpl-{int(time.time())}"
     response = {
-        "id": chat_id,
+        "id": f"chatcmpl-{request_id}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
         "choices": [
             {
                 "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": generated_text,
-                },
-                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": generated_text},
+                "finish_reason": finish_reason,
             }
         ],
         "usage": {
-            "prompt_tokens": len(prompt),
-            "completion_tokens": len(generated_text),
-            "total_tokens": len(prompt) + len(generated_text),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
         },
     }
     return JSONResponse(content=response)
